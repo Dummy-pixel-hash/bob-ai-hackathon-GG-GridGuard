@@ -8,12 +8,14 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fira+Sans:wght@400;500;600;700;800&family=Fira+Code:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
+<script src="https://cdn.jsdelivr.net/npm/motion@11.13.5/dist/motion.js"></script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to main content</a>
 <div class="bg-grid" aria-hidden="true"></div>
 
-<header class="topbar">
+<header class="topbar" id="topbar">
+  <div class="topbar-inner" id="topbar-inner">
   <button class="brand" id="brand-home" type="button" aria-label="GridGuard — go to Grid Status">
     <span class="brand-wrap">
       <span class="brand-word" aria-hidden="true"><span class="bw-g">G</span><span class="bw-rest">rid</span><span class="bw-g">G</span><span class="bw-rest">uard</span></span>
@@ -27,9 +29,14 @@
     <button class="tab" data-view="ai"><span class="tab-icon" id="ti-ai" aria-hidden="true"></span> Guard AI</button>
   </nav>
   <div class="topbar-right">
+    <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle dark mode" title="Toggle dark / light theme">
+      <!-- Only the icon matching the active mode is ever visible: moon in light mode, sun in dark mode. -->
+      <svg id="theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/></svg>
+      <svg id="theme-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+    </button>
     <div class="help-menu">
-      <button class="help-trigger" id="help-trigger" type="button" aria-label="Help" title="Help" aria-expanded="false">?</button>
-      <div class="help-dropdown" id="help-dropdown" hidden>
+      <button class="help-trigger" id="help-trigger" type="button" aria-label="Help" title="Help" aria-expanded="false">Help</button>
+      <div class="help-dropdown scroll-thin" id="help-dropdown" hidden>
         <button type="button" data-help="guide"><b>Basic Guide</b><small>Learn this dashboard view</small></button>
         <button type="button" data-help="contact"><b>Contact</b><small>Reach the GridGuard support team</small></button>
       </div>
@@ -37,6 +44,7 @@
     <span id="provider-badge" class="provider-badge" title="AI briefing provider">AI: …</span>
     <span class="live-time" aria-hidden="true"><i aria-hidden="true"></i><span><small>LIVE TIME</small><b id="live-clock">--:--</b></span></span>
     <span class="operator"><span class="avatar">◉</span><span>Control Room<br><small>Grid Operator</small></span></span>
+  </div>
   </div>
 </header>
 
@@ -51,6 +59,13 @@
       <div>
         <h1>Grid Status</h1>
         <p class="sub">Real-time status of transformers and substations across the network · scores from the live risk engine</p>
+      </div>
+      <div class="head-actions">
+        <label class="sim-scenario-select-wrap" id="sim-scenario-select-wrap" hidden>
+          <span class="sim-scenario-label">Scenario</span>
+          <select id="sim-scenario-select" aria-label="Select simulation scenario"></select>
+        </label>
+        <button class="btn ghost" id="sim-launch">⚡ Live Simulation</button>
       </div>
       <div class="head-filters">
         <label class="search"><span aria-hidden="true">⌕</span><input id="q" type="search" placeholder="Search assets…" aria-label="Search assets"></label>
@@ -95,7 +110,7 @@
         </div>
       </div>
 
-      <aside class="side-panel panel" id="side-panel"></aside>
+      <aside class="side-panel panel scroll-thin" id="side-panel"></aside>
     </div>
 
     <!-- ============ SIMULATION WINDOW (below the map) ============ -->
@@ -132,14 +147,13 @@
           <button type="button" class="btn ghost btn-sm" id="sim-reject">Reject</button>
         </div>
       </div>
-      <div id="sim-change-summary" class="sim-change-summary" hidden></div>
     </div>
 
     <div class="queue-strip panel">
       <div class="queue-head">
         <h2>Attention Queue <small>ranked by overall risk, grid-impact tie-break · live engine scores</small></h2>
       </div>
-      <div id="queue" class="queue"></div>
+      <div id="queue" class="queue scroll-thin"></div>
     </div>
 
     <div class="bottom-strip">
@@ -163,11 +177,11 @@
         <p class="sub">Every transformer and substation, with live risk scores and consequence of failure</p>
       </div>
     </div>
-    <div class="panel table-wrap">
+    <div class="panel table-wrap scroll-thin">
       <table class="assets-table">
         <thead><tr>
           <th>Asset</th><th>Substation</th><th>Region</th><th>Status</th>
-          <th>Risk</th><th>Dominant factor</th><th>Customers</th><th>Action</th><th></th>
+          <th>Risk</th><th>Dominant factor</th><th>Action</th>
         </tr></thead>
         <tbody id="assets-tbody"></tbody>
       </table>
@@ -182,16 +196,11 @@
         <p class="sub" id="plan-meta">Ranked by overall risk, grid-impact tie-break · generated from live engine scores</p>
       </div>
       <div class="head-actions">
-        <label class="sim-scenario-select-wrap" id="sim-scenario-select-wrap" hidden>
-          <span class="sim-scenario-label">Scenario</span>
-          <select id="sim-scenario-select" aria-label="Select simulation scenario"></select>
-        </label>
-        <button class="btn ghost" id="sim-launch">⚡ Live Simulation</button>
         <button class="btn primary" id="regen-plan">↻ Regenerate Plan</button>
       </div>
     </div>
     <div id="sim-plan-notice" class="sim-plan-notice" hidden></div>
-    <div class="panel table-wrap">
+    <div class="panel table-wrap scroll-thin">
       <table class="assets-table">
         <thead><tr>
           <th>#</th><th>Asset</th><th>Status</th><th>Risk</th><th>Customers</th><th>Redundancy</th><th>Recommended action</th><th>Sched. crew</th><th></th>
@@ -222,7 +231,7 @@
           </div>
           <button class="btn ghost btn-sm" id="chat-clear" type="button" title="Clear conversation">Clear</button>
         </div>
-        <div id="chat" class="chat" aria-live="polite" role="log" aria-label="Guard AI conversation"></div>
+        <div id="chat" class="chat scroll-thin" aria-live="polite" role="log" aria-label="Guard AI conversation"></div>
         <div class="suggestions" id="suggestions"></div>
         <form id="chat-form" class="chat-form">
           <label class="vh" for="chat-input">Ask Guard AI about assets or risk</label>

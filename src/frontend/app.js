@@ -6,6 +6,19 @@
    serves by default). It is clearly labelled "Preview data" in the UI. */
 "use strict";
 
+/* ---------- theme ---------- */
+(function () {
+  const dark = localStorage.getItem("gg-theme") === "dark";
+  if (dark) document.body.classList.add("dark");
+  // Sync icons immediately so the correct one shows before renderAll fires.
+  document.addEventListener("DOMContentLoaded", function syncIcons() {
+    const moon = document.getElementById("theme-icon-moon");
+    const sun  = document.getElementById("theme-icon-sun");
+    if (moon) moon.hidden = dark;
+    if (sun)  sun.hidden  = !dark;
+  }, { once: true });
+})();
+
 const S = {
   assets: [], summary: null, priorities: null, briefing: null,
   selected: null, sideTab: "overview", currentView: "overview",
@@ -21,8 +34,8 @@ const TYPE_ICON = { transformer: ICON_TX, substation: ICON_SUB };
 /* Inline SVG icons for nav tabs and UI elements — consistent, accessible, no external dep */
 const NAV_ICON_OVERVIEW = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 6.5L8 2l6 4.5V14H10v-3H6v3H2z"/></svg>`;
 const NAV_ICON_ASSETS  = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="2.5" rx=".8"/><rect x="1.5" y="6.75" width="13" height="2.5" rx=".8"/><rect x="1.5" y="11" width="13" height="2.5" rx=".8"/></svg>`;
-const NAV_ICON_MAINT   = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.6 2.4a4 4 0 1 0 4 4 4 4 0 0 0-4-4zM6.1 9.9 2 14"/><circle cx="9.6" cy="6.4" r="1.4"/></svg>`;
-const NAV_ICON_AI      = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13z"/><path d="M5.5 9.5s.8 1.5 2.5 1.5 2.5-1.5 2.5-1.5M6 6.3h.01M10 6.3h.01"/></svg>`;
+const NAV_ICON_MAINT   = "⚒";
+const NAV_ICON_AI      = "✦";
 const SVG_CREW         = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:inline;vertical-align:-.15em;margin-right:4px"><path d="M8 1.5a3 3 0 1 1 0 6 3 3 0 0 1 0-6zM2 14c0-3.3 2.7-5 6-5s6 1.7 6 5"/></svg>`;
 const POS = {
   "TX-001": [11, 17], "TX-002": [33, 15], "TX-003": [58, 16], "TX-004": [82, 16],
@@ -241,7 +254,7 @@ async function init() {
   const worst = [...S.assets].sort((a, b) => b.overall_risk - a.overall_risk)[0];
   S.selected = worst ? worst.id : null;
   S._lastRisk = riskSnapshot(S.assets);
-  buildFilters(); renderAll(); startClock(); badge();
+  buildFilters(); renderAll(); startClock(); badge(); initTopbarScroll();
 }
 
 function buildFilters() {
@@ -423,6 +436,16 @@ function selectNode(id) {
   renderSide();
 }
 
+function deselectNode() {
+  if (S.selected == null) return;
+  S.selected = null;
+  document.querySelectorAll("#nodes .node").forEach((n) => {
+    n.classList.remove("selected");
+    n.setAttribute("aria-pressed", "false");
+  });
+  renderSide();
+}
+
 function setMapZoom(next) {
   S.mapZoom = Math.min(1.6, Math.max(0.8, next));
   $("map-canvas").style.transform = `scale(${S.mapZoom})`;
@@ -458,7 +481,17 @@ function ringSVG(score, extraCls) {
 function renderSide() {
   const a = S.assets.find((x) => x.id === S.selected);
   const el = $("side-panel");
-  if (!a) { el.innerHTML = `<p style="color:var(--muted)">Select an asset on the grid.</p>`; return; }
+  if (!a) {
+    el.innerHTML = `
+      <div class="sp-empty">
+        <div class="sp-empty-ico" aria-hidden="true">◉</div>
+        <b>No asset selected</b>
+        <p>Select a transformer or substation on the grid to inspect live risk, sensors and impact.</p>
+      </div>
+      <div id="sim-change-summary" class="sim-change-summary" hidden></div>`;
+    renderSimEvents();
+    return;
+  }
   const s = a.sensors_raw, gi = a.grid_impact;
   // Live-change tracking: snapshot this render's key values and compare
   // against the previous render — components whose backend values moved get
@@ -531,10 +564,12 @@ function renderSide() {
     <div class="sp-actions">
       <button class="btn ghost" id="sp-details">View Details</button>
       <button class="btn primary" id="sp-maint">Schedule Maintenance</button>
-    </div>`;
+    </div>
+    <div id="sim-change-summary" class="sim-change-summary" hidden></div>`;
   el.querySelectorAll(".sp-tabs button").forEach((b) => b.onclick = () => { S.sideTab = b.dataset.t; renderSide(); });
   $("sp-details").onclick = () => openModal(a.id);
   $("sp-maint").onclick = () => openConfirm(a.id);
+  renderSimEvents();
 }
 
 const riskWord = (a) => a.status === "Healthy" ? "Healthy" : a.status === "Monitoring" ? "Monitoring" : a.status === "High" ? "High Risk" : "Out of Order";
@@ -564,15 +599,120 @@ function renderQueue() {
     return;
   }
   $("queue").innerHTML = ranked.map((a, i) => `
-    <button type="button" class="qcard ${a.status}" data-id="${a.id}" aria-label="${a.id}, ${a.substation}, ${a.status}, risk ${a.overall_risk} of 100. Activate to inspect.">
-      <span class="qr"><span>#${i + 1} priority</span><b style="color:${COLORS[a.status]}">${a.overall_risk}</b></span>
-      <span class="qa">${a.id} · ${esc(a.substation)}</span>
-      <span class="qd">${a.status} · ${esc(a.dominant_factor_label)} · ${fmtInt(a.grid_impact.customers_served)} customers</span>
-    </button>`).join("");
-  document.querySelectorAll(".qcard").forEach((c) => c.onclick = () => {
-    selectNode(c.dataset.id);
-    document.querySelector(".overview-grid").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    <div class="qcard-wrap ${a.status}" data-id="${a.id}">
+      <button type="button" class="qcard-summary" aria-expanded="false"
+        aria-label="${a.id}, risk ${a.overall_risk} of 100. Activate to inspect.">
+        <span class="q-rank">#${i + 1}</span>
+        <span class="q-name">${a.id}</span>
+        <span class="q-risk" style="color:${COLORS[a.status]}">${a.overall_risk}</span>
+      </button>
+    </div>`).join("");
+  // Hover popover: opens on hover/focus, closes when the pointer leaves.
+  // Click still inspects the asset; on touch devices tap toggles the popover.
+  const coarse = window.matchMedia && window.matchMedia("(hover: none)").matches;
+  document.querySelectorAll(".qcard-wrap").forEach((wrap, i) => {
+    const btn = wrap.querySelector(".qcard-summary");
+    const show = () => showQueuePop(wrap, ranked[i], i + 1);
+    wrap.addEventListener("mouseenter", show);
+    wrap.addEventListener("mouseleave", () => hideQueuePop());
+    btn.addEventListener("focus", show);
+    btn.addEventListener("blur", () => hideQueuePop());
+    btn.addEventListener("keydown", (e) => { if (e.key === "Escape") hideQueuePop(true); });
+    btn.addEventListener("click", () => {
+      if (coarse) {
+        const pop = document.getElementById("queue-pop");
+        if (pop && !pop.hidden && pop.dataset.card === wrap.dataset.id) hideQueuePop(true);
+        else show();
+      } else {
+        hideQueuePop(true);
+        selectNode(wrap.dataset.id);
+        document.querySelector(".overview-grid").scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+    });
   });
+}
+
+function reducedMotion() {
+  return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+/* Floating queue popover: a single body-level panel positioned by JS next to
+   the hovered card, so opening it never shifts the strip or gets clipped by
+   the queue's scroll box. Pops above the card, flipping below when cramped. */
+let _qpHideTimer = null;
+function queuePop() {
+  let el = document.getElementById("queue-pop");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "queue-pop";
+    el.className = "queue-pop";
+    el.setAttribute("role", "dialog");
+    el.setAttribute("aria-label", "Asset details");
+    el.hidden = true;
+    document.body.appendChild(el);
+    el.addEventListener("mouseenter", () => clearTimeout(_qpHideTimer));
+    el.addEventListener("mouseleave", () => hideQueuePop());
+    // Never let it float detached: any scroll or resize dismisses it.
+    window.addEventListener("scroll", () => hideQueuePop(true), { capture: true, passive: true });
+    window.addEventListener("resize", () => hideQueuePop(true));
+  }
+  return el;
+}
+
+function showQueuePop(card, a, rank) {
+  if (!card || !a) return;
+  const pop = queuePop();
+  clearTimeout(_qpHideTimer);
+  pop.className = `queue-pop ${a.status}`;
+  pop.dataset.card = a.id;
+  pop.innerHTML = `
+    <div class="qp-head">
+      <span class="q-rank">#${rank}</span>
+      <span class="q-name">${a.id}</span>
+      <span class="q-risk" style="color:${COLORS[a.status]}">${a.overall_risk}</span>
+    </div>
+    <div class="qd-row"><span>Substation</span><b>${esc(a.substation)}</b></div>
+    <div class="qd-row"><span>Status</span><b style="color:${COLORS[a.status]}">${a.status}</b></div>
+    <div class="qd-row"><span>Dominant factor</span><b>${esc(a.dominant_factor_label)}</b></div>
+    <div class="qd-row"><span>Customers</span><b>${fmtInt(a.grid_impact.customers_served)}</b></div>
+    <div class="qd-actions"><button type="button" class="btn ghost" data-inspect="${a.id}">Open full record ↗</button></div>`;
+  pop.querySelector("[data-inspect]").onclick = (e) => {
+    e.stopPropagation();
+    hideQueuePop(true);
+    selectNode(a.id);
+    document.querySelector(".overview-grid").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  };
+  // Measure off-screen, then pin next to the card.
+  pop.hidden = false;
+  pop.style.visibility = "hidden";
+  pop.style.left = "0px";
+  pop.style.top = "0px";
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  const r = card.getBoundingClientRect();
+  const left = Math.max(8, Math.min(r.left + r.width / 2 - pw / 2, window.innerWidth - pw - 8));
+  let top = r.top - ph - 10;
+  if (top < 8) top = r.bottom + 10;
+  top = Math.max(8, Math.min(top, window.innerHeight - ph - 8));
+  pop.style.left = left + "px";
+  pop.style.top = top + "px";
+  pop.style.visibility = "";
+  if (window.Motion && !reducedMotion()) {
+    Motion.animate(pop, { opacity: [0, 1], transform: ["translateY(4px)", "translateY(0)"] },
+      { duration: 0.18, easing: "ease-out" });
+  }
+  card.querySelector(".qcard-summary").setAttribute("aria-expanded", "true");
+}
+
+function hideQueuePop(immediate) {
+  clearTimeout(_qpHideTimer);
+  const run = () => {
+    const pop = document.getElementById("queue-pop");
+    if (pop) pop.hidden = true;
+    document.querySelectorAll(".qcard-summary[aria-expanded='true']")
+      .forEach((b) => b.setAttribute("aria-expanded", "false"));
+  };
+  if (immediate) run();
+  else _qpHideTimer = setTimeout(run, 120);
 }
 
 function renderStrips() {
@@ -603,7 +743,7 @@ function renderStrips() {
 function renderAssetsTable() {
   const rows = [...filtered()].sort((a, b) => b.overall_risk - a.overall_risk);
   if (!rows.length) {
-    $("assets-tbody").innerHTML = `<tr><td colspan="9" class="empty-cell">No assets match the current filters. <button type="button" class="linklike" id="assets-clear">Clear filters</button></td></tr>`;
+    $("assets-tbody").innerHTML = `<tr><td colspan="7" class="empty-cell">No assets match the current filters. <button type="button" class="linklike" id="assets-clear">Clear filters</button></td></tr>`;
     $("assets-clear").onclick = clearFilters;
     return;
   }
@@ -613,9 +753,7 @@ function renderAssetsTable() {
     <td><span class="status-pill ${a.status}">${a.status}</span></td>
     <td><span class="riskbar"><span class="track"><span class="fill" style="width:${a.overall_risk}%;background:${barColor(a.overall_risk)}"></span></span>${a.overall_risk}</span></td>
     <td>${esc(a.dominant_factor_label)}</td>
-    <td style="font-family:var(--mono)">${fmtInt(a.grid_impact.customers_served)}</td>
-    <td><small>${esc(a.recommended_action)}</small></td>
-    <td><button class="linklike" data-open="${a.id}">Details ›</button></td></tr>`).join("");
+    <td><small>${esc(a.recommended_action)}</small></td></tr>`).join("");
   bindOpenButtons($("assets-tbody"));
 }
 
@@ -1189,6 +1327,35 @@ function startClock() {
   const tick = () => { $("live-clock").textContent = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }); };
   tick(); setInterval(tick, 1000);
 }
+function applyTheme(dark) {
+  document.body.classList.toggle("dark", dark);
+  localStorage.setItem("gg-theme", dark ? "dark" : "light");
+  const btn = $("theme-toggle");
+  const moon = $("theme-icon-moon");
+  const sun  = $("theme-icon-sun");
+  if (btn)  btn.setAttribute("aria-label", dark ? "Switch to light mode" : "Switch to dark mode");
+  if (moon) moon.hidden = dark;
+  if (sun)  sun.hidden  = !dark;
+}
+
+/* ---------- sticky topbar → centred pill on scroll ---------- */
+function initTopbarScroll() {
+  const topbar = $("topbar");
+  if (!topbar) return;
+  let ticking = false;
+  const PILL_ON = 80;   // scroll past this and the bar becomes a pill
+  const PILL_OFF = 4;   // scroll back to (almost) the very top to revert
+  function update() {
+    const y = window.scrollY || document.documentElement.scrollTop;
+    if (y > PILL_ON) topbar.classList.add("is-pill");
+    else if (y <= PILL_OFF) topbar.classList.remove("is-pill");
+    ticking = false;
+  }
+  window.addEventListener("scroll", () => {
+    if (!ticking) { requestAnimationFrame(update); ticking = true; }
+  }, { passive: true });
+  update();
+}
 function renderAll() {
   // Inject nav SVG icons into the static HTML tab spans
   const _ti = { overview: NAV_ICON_OVERVIEW, assets: NAV_ICON_ASSETS, maintenance: NAV_ICON_MAINT, ai: NAV_ICON_AI };
@@ -1210,6 +1377,8 @@ function renderAll() {
     e.preventDefault();
     setMapZoom(S.mapZoom + (e.deltaY < 0 ? 0.1 : -0.1));
   };
+  // Clicking empty map area (anything that isn't a node) deselects.
+  $("map-canvas").onclick = (e) => { if (!e.target.closest(".node")) deselectNode(); };
   $("qa-plan").onclick = () => switchView("maintenance");
   $("qa-crew").onclick = async () => {
     switchView("maintenance");
@@ -1247,6 +1416,12 @@ function renderAll() {
     if (!e.target.closest(".help-menu")) { $("help-dropdown").hidden = true; $("help-trigger").setAttribute("aria-expanded", "false"); }
   });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal(); closeHelp(); closeConfirm(); } });
+  const themeBtn = $("theme-toggle");
+  if (themeBtn) {
+    // Sync icon state with current theme on first render
+    applyTheme(document.body.classList.contains("dark"));
+    themeBtn.onclick = () => applyTheme(!document.body.classList.contains("dark"));
+  }
 }
 
 /* ============================================================
