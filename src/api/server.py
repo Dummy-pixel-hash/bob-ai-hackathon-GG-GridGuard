@@ -2,7 +2,8 @@
 
 No new dependencies: everything here uses the Python standard library plus
 the existing GridGuard packages (``data``, ``normalisation``,
-``risk_engine``, ``storage``, ``lifecycle``, ``ai_briefing``).
+``risk_engine``, ``storage``, ``lifecycle``, ``ai_briefing``,
+``simulation``, ``maintenance``).
 
 Endpoints
 ---------
@@ -14,6 +15,20 @@ GET  /api/briefing_info      active AI provider / model (mock when offline)
 POST /api/briefing           {"question": str, "asset_id": str|None,
                               "history": [{"role":"user"|"assistant","content":str}]}
                              -> grounded conversational answer
+GET  /api/simulation/status  current simulation phase + plan state
+POST /api/simulation/start   {"lat":float?, "lon":float?, "phase":str?}
+POST /api/simulation/advance advance to next phase
+POST /api/simulation/stop    stop simulation, restore static data
+POST /api/simulation/phase   {"phase": str}  — jump to named phase
+GET  /api/simulation/plan    current proposed maintenance plan
+POST /api/simulation/approve {"approved_by": str?} — operator approves plan
+POST /api/simulation/reject  reject pending plan
+GET  /api/scenario/list      list of available named scenarios
+POST /api/scenario/run       {"scenario_id":str?, "lat":float?, "lon":float?}
+POST /api/scenario/pause     pause the running scenario
+POST /api/scenario/resume    resume a paused scenario
+POST /api/scenario/reset     stop scenario, restore static demo
+GET  /api/scenario/tick      advance time + return current interpolated state
 GET  /                       the control-room dashboard (static files in ../frontend)
 
 Run with:  python3 run_ui.py   (from the repository root)
@@ -107,12 +122,80 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(STATE.priorities(), head_only=head_only)
         elif path == "/api/briefing_info":
             self._send_json(STATE.briefing_info(), head_only=head_only)
+        elif path == "/api/simulation/status":
+            self._send_json(STATE.simulation_status(), head_only=head_only)
+        elif path == "/api/simulation/plan":
+            self._send_json(STATE.simulation_plan(), head_only=head_only)
+        elif path == "/api/scenario/list":
+            self._send_json(STATE.scenario_list(), head_only=head_only)
+        elif path == "/api/scenario/tick":
+            self._send_json(STATE.scenario_tick(), head_only=head_only)
         else:
             self._send_json({"error": "not found"}, 404, head_only=head_only)
 
     def do_POST(self) -> None:  # noqa: N802
         assert STATE is not None
         path = urlparse(self.path).path
+
+        # ── Simulation control endpoints (no body required for most) ────────
+        if path == "/api/simulation/start":
+            body = self._read_json_body()
+            lat = body.get("lat")
+            lon = body.get("lon")
+            phase = body.get("phase") or None
+            try:
+                flat = float(lat) if lat is not None else None
+                flon = float(lon) if lon is not None else None
+            except (TypeError, ValueError):
+                flat = flon = None
+            self._send_json(STATE.simulation_start(lat=flat, lon=flon, phase=phase))
+            return
+        if path == "/api/simulation/advance":
+            self._send_json(STATE.simulation_advance())
+            return
+        if path == "/api/simulation/stop":
+            self._send_json(STATE.simulation_stop())
+            return
+        if path == "/api/simulation/phase":
+            body = self._read_json_body()
+            phase = str(body.get("phase", ""))
+            if not phase:
+                self._send_json({"error": "phase required"}, 400)
+                return
+            self._send_json(STATE.simulation_set_phase(phase))
+            return
+        if path == "/api/simulation/approve":
+            body = self._read_json_body()
+            approved_by = str(body.get("approved_by", "operator") or "operator")
+            self._send_json(STATE.simulation_approve_plan(approved_by))
+            return
+        if path == "/api/simulation/reject":
+            self._send_json(STATE.simulation_reject_plan())
+            return
+
+        # ── Scenario runner endpoints ─────────────────────────────────────────
+        if path == "/api/scenario/run":
+            body = self._read_json_body()
+            sid = body.get("scenario_id") or None
+            lat = body.get("lat")
+            lon = body.get("lon")
+            try:
+                flat = float(lat) if lat is not None else None
+                flon = float(lon) if lon is not None else None
+            except (TypeError, ValueError):
+                flat = flon = None
+            self._send_json(STATE.scenario_run(scenario_id=sid, lat=flat, lon=flon))
+            return
+        if path == "/api/scenario/pause":
+            self._send_json(STATE.scenario_pause())
+            return
+        if path == "/api/scenario/resume":
+            self._send_json(STATE.scenario_resume())
+            return
+        if path == "/api/scenario/reset":
+            self._send_json(STATE.scenario_reset())
+            return
+
         if path != "/api/briefing":
             self._send_json({"error": "not found"}, 404)
             return
@@ -135,6 +218,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "question must be a non-empty string"}, 400)
             return
         self._send_json(STATE.answer_question(question, asset_id, history))
+
+    def _read_json_body(self) -> dict:
+        """Read and parse the POST body as JSON; return {} on any error."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            return json.loads(raw.decode("utf-8") or "{}") or {}
+        except (ValueError, UnicodeDecodeError):
+            return {}
 
     def log_message(self, fmt, *args) -> None:  # noqa: N802
         sys.stderr.write("gridguard: " + fmt % args + "\n")
