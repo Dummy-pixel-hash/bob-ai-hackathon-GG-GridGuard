@@ -232,7 +232,37 @@ class TestScenarioTickChanges:
 
 
 # ===========================================================================
-# 4.  Maintenance-plan task deltas
+# 4.  No spurious re-apply on the first tick (approval race regression)
+# ===========================================================================
+
+class TestNoSpuriousReapply:
+
+    def test_first_tick_after_run_does_not_rebuild_plan(self, state):
+        """scenario_run() applies step 0 immediately, so the next tick with
+        no elapsed time must not rebuild the plan or emit new events."""
+        state.scenario_run(scenario_id="storm_surge")
+        plan_before = state._sim_plan
+        state.simulation_status()  # consume the start events
+        tick = state.scenario_tick()
+        assert tick["changes"] == []
+        assert state._sim_plan is plan_before
+
+    def test_approve_then_immediate_tick_stays_approved(self, state):
+        """Approving and then ticking with no time elapsed must not
+        resurrect a pending plan (the approve/tick race)."""
+        state.scenario_run(scenario_id="storm_surge")
+        state.simulation_status()  # consume the start events
+        state.simulation_approve_plan()
+        tick = state.scenario_tick()
+        assert tick["plan_pending_approval"] is False
+        assert tick["plan_approved"] is True
+        plan = state.simulation_plan()
+        assert plan.get("approved") is True
+        assert plan["task_changes"] == []
+
+
+# ===========================================================================
+# 5.  Maintenance-plan task deltas
 # ===========================================================================
 
 class TestPlanTaskChanges:

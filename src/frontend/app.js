@@ -654,7 +654,12 @@ function renderPlan() {
         : "Priorities reordered from live engine scores.";
       const sched = (p.change_summary || []).length
         ? `<br><small>Scheduler: ${p.change_summary.map(esc).join("; ")}.</small>` : "";
-      planNotice.innerHTML = head + sched;
+      planNotice.innerHTML = head + sched +
+        `<div class="plan-notice-actions"><button type="button" class="btn primary btn-sm" id="plan-approve-btn">Approve plan</button><button type="button" class="btn ghost btn-sm" id="plan-reject-btn">Reject</button></div>`;
+      const apBtn = $("plan-approve-btn");
+      if (apBtn) apBtn.onclick = simApprovePlan;
+      const rjBtn = $("plan-reject-btn");
+      if (rjBtn) rjBtn.onclick = simRejectPlan;
     } else if (isSimPlan && p.approved) {
       planNotice.hidden = false;
       planNotice.innerHTML = `✓ <b>Simulation plan approved</b> (${esc(p.approved_by)} · ${new Date(p.approved_at).toLocaleString()})`;

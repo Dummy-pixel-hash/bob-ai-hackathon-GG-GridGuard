@@ -539,6 +539,9 @@ details.m-card[open] summary{margin-bottom:10px}
 /* ---------- simulation banner & controls ---------- */
 .sim-banner{margin:14px 0 0;border:1px solid var(--border-info);border-radius:10px;
   background:var(--surface-info);overflow:hidden}
+/* on Grid Status the simulation window sits below the map grid */
+#view-overview .sim-banner{margin:0 0 18px}
+.plan-notice-actions{display:flex;gap:8px;margin-top:10px}
 .sim-banner[hidden]{display:none}
 .sim-banner-inner{display:flex;align-items:center;justify-content:space-between;
   gap:14px;padding:12px 16px;flex-wrap:wrap}

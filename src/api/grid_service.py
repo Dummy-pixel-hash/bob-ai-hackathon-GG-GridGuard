@@ -1025,6 +1025,11 @@ class GridState:
             new_inputs[aid] = inputs
             new_results[aid] = result
 
+        # Seed the tick's pressure marker so the next scenario_tick() does
+        # not redundantly re-apply (and spuriously resurrect a pending plan
+        # right after an operator approval).
+        self._sim_pressure["__last_pressure__"] = state.sensor_pressure
+
         self._inputs = new_inputs
         self._results = new_results
 
@@ -1100,6 +1105,10 @@ class GridState:
             result = score_asset(inputs)
             new_inputs[aid] = inputs
             new_results[aid] = result
+
+        # Seed the tick's pressure marker (same rationale as the
+        # scenario-aware path above).
+        self._sim_pressure["__last_pressure__"] = phase_info.sensor_pressure
 
         self._inputs = new_inputs
         self._results = new_results

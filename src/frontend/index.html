@@ -45,42 +45,6 @@
     <span><b>Preview data.</b> Backend unreachable — scores come from the built-in demo set. Run <code>python3 run_ui.py</code> for live engine data.</span>
     <button type="button" id="offline-dismiss" class="btn ghost btn-sm">Dismiss</button>
   </div>
-  <!-- ============ SIMULATION BANNER ============ -->
-  <div id="sim-banner" class="sim-banner" hidden>
-    <div class="sim-banner-inner">
-      <div class="sim-phase-track">
-        <span class="sim-dot sim-dot-pulse" aria-hidden="true" id="sim-dot">◎</span>
-        <div class="sim-text">
-          <b id="sim-phase-label">Simulation active</b>
-          <span id="sim-phase-desc">—</span>
-        </div>
-      </div>
-      <div class="sim-controls">
-        <span id="sim-scenario-badge" class="sim-scenario-badge"></span>
-        <span id="sim-phase-counter" class="sim-counter"></span>
-        <button type="button" class="btn sim-btn" id="sim-run" title="Run scenario">▶ Run</button>
-        <button type="button" class="btn sim-btn" id="sim-pause" title="Pause scenario" hidden>⏸ Pause</button>
-        <button type="button" class="btn sim-btn" id="sim-resume" title="Resume scenario" hidden>▶ Resume</button>
-        <button type="button" class="btn ghost btn-sm" id="sim-reset">↺ Reset</button>
-        <button type="button" class="btn ghost btn-sm" id="sim-stop">✕ Stop</button>
-      </div>
-    </div>
-    <!-- Step progress bar -->
-    <div class="sim-progress-wrap" id="sim-progress-wrap" hidden>
-      <div class="sim-progress-track">
-        <div class="sim-progress-fill" id="sim-progress-fill" style="width:0%"></div>
-      </div>
-      <span class="sim-progress-label" id="sim-progress-label"></span>
-    </div>
-    <div id="sim-approval-bar" class="sim-approval-bar" hidden>
-      <span><b>⚠ Plan updated by simulation</b> — maintenance priorities have been reordered. Operator approval required.</span>
-      <div>
-        <button type="button" class="btn primary btn-sm" id="sim-approve">Approve plan</button>
-        <button type="button" class="btn ghost btn-sm" id="sim-reject">Reject</button>
-      </div>
-    </div>
-    <div id="sim-change-summary" class="sim-change-summary" hidden></div>
-  </div>
   <!-- ============ OVERVIEW ============ -->
   <section id="view-overview" class="view active" aria-label="Grid status">
     <div class="page-head">
@@ -132,6 +96,43 @@
       </div>
 
       <aside class="side-panel panel" id="side-panel"></aside>
+    </div>
+
+    <!-- ============ SIMULATION WINDOW (below the map) ============ -->
+    <div id="sim-banner" class="sim-banner" hidden>
+      <div class="sim-banner-inner">
+        <div class="sim-phase-track">
+          <span class="sim-dot sim-dot-pulse" aria-hidden="true" id="sim-dot">◎</span>
+          <div class="sim-text">
+            <b id="sim-phase-label">Simulation active</b>
+            <span id="sim-phase-desc">—</span>
+          </div>
+        </div>
+        <div class="sim-controls">
+          <span id="sim-scenario-badge" class="sim-scenario-badge"></span>
+          <span id="sim-phase-counter" class="sim-counter"></span>
+          <button type="button" class="btn sim-btn" id="sim-run" title="Run scenario">▶ Run</button>
+          <button type="button" class="btn sim-btn" id="sim-pause" title="Pause scenario" hidden>⏸ Pause</button>
+          <button type="button" class="btn sim-btn" id="sim-resume" title="Resume scenario" hidden>▶ Resume</button>
+          <button type="button" class="btn ghost btn-sm" id="sim-reset">↺ Reset</button>
+          <button type="button" class="btn ghost btn-sm" id="sim-stop">✕ Stop</button>
+        </div>
+      </div>
+      <!-- Step progress bar -->
+      <div class="sim-progress-wrap" id="sim-progress-wrap" hidden>
+        <div class="sim-progress-track">
+          <div class="sim-progress-fill" id="sim-progress-fill" style="width:0%"></div>
+        </div>
+        <span class="sim-progress-label" id="sim-progress-label"></span>
+      </div>
+      <div id="sim-approval-bar" class="sim-approval-bar" hidden>
+        <span><b>⚠ Plan updated by simulation</b> — maintenance priorities have been reordered. Operator approval required.</span>
+        <div>
+          <button type="button" class="btn primary btn-sm" id="sim-approve">Approve plan</button>
+          <button type="button" class="btn ghost btn-sm" id="sim-reject">Reject</button>
+        </div>
+      </div>
+      <div id="sim-change-summary" class="sim-change-summary" hidden></div>
     </div>
 
     <div class="queue-strip panel">
