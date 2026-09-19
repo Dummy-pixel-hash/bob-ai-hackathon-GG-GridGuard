@@ -18,6 +18,12 @@ const COLORS = { Healthy: "#187245", Monitoring: "#8a6a0c", High: "#b45309", Cri
 const ICON_TX = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 4.5h3M13 4.5h3M9.5 4.5V8M14.5 4.5V8"/><rect x="6.5" y="8" width="11" height="10" rx="1.5"/><path d="M4 10.5h2.5M4 13h2.5M4 15.5h2.5M17.5 10.5h2.5M17.5 13h2.5M17.5 15.5h2.5M5.5 21h13"/></svg>`;
 const ICON_SUB = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 3.5V6M10.9 8.5L12 6L13.1 8.5"/><path d="M9.2 21L11 8.5M14.8 21L13 8.5"/><path d="M8 10.5h8M6.8 14.5h10.4M9.7 18.5h4.6"/><path d="M9.5 10.5v2.5M14.5 10.5v2.5M8.3 14.5v2.5M15.7 14.5v2.5"/></svg>`;
 const TYPE_ICON = { transformer: ICON_TX, substation: ICON_SUB };
+/* Inline SVG icons for nav tabs and UI elements — consistent, accessible, no external dep */
+const NAV_ICON_OVERVIEW = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 6.5L8 2l6 4.5V14H10v-3H6v3H2z"/></svg>`;
+const NAV_ICON_ASSETS  = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="2.5" rx=".8"/><rect x="1.5" y="6.75" width="13" height="2.5" rx=".8"/><rect x="1.5" y="11" width="13" height="2.5" rx=".8"/></svg>`;
+const NAV_ICON_MAINT   = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.6 2.4a4 4 0 1 0 4 4 4 4 0 0 0-4-4zM6.1 9.9 2 14"/><circle cx="9.6" cy="6.4" r="1.4"/></svg>`;
+const NAV_ICON_AI      = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13z"/><path d="M5.5 9.5s.8 1.5 2.5 1.5 2.5-1.5 2.5-1.5M6 6.3h.01M10 6.3h.01"/></svg>`;
+const SVG_CREW         = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:inline;vertical-align:-.15em;margin-right:4px"><path d="M8 1.5a3 3 0 1 1 0 6 3 3 0 0 1 0-6zM2 14c0-3.3 2.7-5 6-5s6 1.7 6 5"/></svg>`;
 const POS = {
   "TX-001": [11, 17], "TX-002": [33, 15], "TX-003": [58, 16], "TX-004": [82, 16],
   "TX-005": [22, 46], "TX-006": [50, 40], "TX-007": [76, 52], "TX-008": [40, 71],
@@ -234,6 +240,7 @@ async function init() {
   }
   const worst = [...S.assets].sort((a, b) => b.overall_risk - a.overall_risk)[0];
   S.selected = worst ? worst.id : null;
+  S._lastRisk = riskSnapshot(S.assets);
   buildFilters(); renderAll(); startClock(); badge();
 }
 
@@ -304,21 +311,59 @@ function refreshFiltered() {
 }
 
 /* ---------------- network map ---------------- */
+function nodeEl(id) {
+  return document.querySelector(`#nodes .node[data-node-id="${id}"]`);
+}
+
+const riskSnapshot = (assets) => Object.fromEntries(assets.map((a) => [a.id, a.overall_risk]));
+
+/* An asset is "deteriorating" while the simulation is live and its engine
+   risk keeps climbing between polls — pure visualisation of backend truth. */
+function isDeteriorating(a) {
+  if (!SIM.active || SIM.paused || SIM.completed) return false;
+  const prev = S._lastRisk ? S._lastRisk[a.id] : undefined;
+  return prev != null && a.overall_risk > prev + 0.05;
+}
+
+/* In-place map update: nodes are created once and then updated (status band,
+   risk value, selection, deteriorating halo, one-shot change flashes) so a
+   simulation refresh never replays the entrance animation or loses context. */
 function renderMap() {
-  const vis = new Set(filtered().map((a) => a.id));
   const box = $("nodes");
-  box.innerHTML = "";
-  ORDER.filter((id) => S.assets.some((a) => a.id === id)).forEach((id, i) => {
-    const a = S.assets.find((x) => x.id === id);
-    if (!vis.has(id)) return;
+  const vis = new Set(filtered().map((a) => a.id));
+  const byId = new Map(S.assets.map((a) => [a.id, a]));
+  // Exactly one live marker per asset survives: drop unknown ids and
+  // 2nd+ duplicates (keep the first), and heal any stray missing its base.
+  const seen = new Set();
+  box.querySelectorAll("[data-node-id]").forEach((n) => {
+    const nid = n.dataset.nodeId;
+    if (!byId.has(nid) || seen.has(nid)) { n.remove(); return; }
+    seen.add(nid);
+    if (!n.classList.contains("node")) n.classList.add("node");
+  });
+  ORDER.filter((id) => byId.has(id)).forEach((id, i) => {
+    const a = byId.get(id);
+    let el = box.querySelector(`.node[data-node-id="${id}"]`);
+    if (!el) {
+      el = document.createElement("button");
+      el.type = "button";
+      el.className = "node"; // base class FIRST — dedup + positioning + flash layers depend on it
+      el.dataset.nodeId = id;
+      el.style.animationDelay = (i * 0.05) + "s";
+      el.onclick = () => selectNode(id);
+      el.ondblclick = () => openModal(id);
+      box.appendChild(el);
+    }
+    el.style.display = vis.has(id) ? "" : "none";
     const [x, y] = POS[id] || [10 + i * 10, 50];
-    const el = document.createElement("button");
-    el.type = "button";
-    el.dataset.nodeId = id;
-    el.className = `node st-${a.status}` + (a.status === "Critical" ? " pulse" : "") +
-      (S.selected === id ? " selected" : "");
     el.style.left = x + "%"; el.style.top = y + "%";
-    el.style.animationDelay = (i * 0.05) + "s";
+    el.classList.toggle("st-Healthy", a.status === "Healthy");
+    el.classList.toggle("st-Monitoring", a.status === "Monitoring");
+    el.classList.toggle("st-High", a.status === "High");
+    el.classList.toggle("st-Critical", a.status === "Critical");
+    el.classList.toggle("pulse", a.status === "Critical");
+    el.classList.toggle("selected", S.selected === id);
+    el.classList.toggle("deteriorating", isDeteriorating(a));
     el.title = `${a.id} · ${a.status} · ${a.overall_risk}/100`;
     el.setAttribute("aria-label", `${a.id}, ${a.asset_type}, ${a.status}, risk ${a.overall_risk} of 100. Activate to inspect.`);
     el.setAttribute("aria-pressed", S.selected === id ? "true" : "false");
@@ -326,15 +371,36 @@ function renderMap() {
       <span><span class="nid">${esc(a.id)}</span><br><span class="ntype">${esc(cap(a.asset_type))}</span></span>
       <span class="nrisk" style="color:${barColor(a.overall_risk)}">${a.overall_risk}</span>
       <span class="ndot" aria-hidden="true"></span>`;
-    el.onclick = () => selectNode(id);
-    el.ondblclick = () => openModal(id);
-    box.appendChild(el);
+    // consume queued one-shot flashes from the latest backend change events
+    const f = SIM.flash && SIM.flash[id];
+    if (f) {
+      ["flash-changed", "flash-escalated", "flash-improved"].forEach((c) => el.classList.remove(c));
+      void el.offsetWidth; // restart the one-shot animation
+      el.classList.add(f);
+      delete SIM.flash[id];
+      setTimeout(() => { const n = nodeEl(id); if (n) n.classList.remove(f); }, 2400);
+    }
   });
-  if (!box.children.length) {
-    box.innerHTML = `<div class="map-empty">No assets match the current filters.</div>`;
+  const anyVis = ORDER.some((id) => vis.has(id) && byId.has(id));
+  let empty = box.querySelector(".map-empty");
+  if (!anyVis) {
+    if (!empty) {
+      empty = document.createElement("div");
+      empty.className = "map-empty";
+      box.appendChild(empty);
+    }
+    empty.textContent = "No assets match the current filters.";
+  } else if (empty) {
+    empty.remove();
   }
-  // connection lines
+  drawNetlines();
+}
+
+/* Static topology dressing — built once; zoom is a pure CSS transform. */
+function drawNetlines() {
   const svg = $("netlines");
+  if (svg.dataset.built === "1") return;
+  svg.dataset.built = "1";
   const pts = ORDER.map((id) => POS[id]);
   svg.setAttribute("viewBox", "-35 -35 170 170");
   const streets = buildStreets();
@@ -380,9 +446,9 @@ function buildStreets() {
 }
 
 /* ---------------- side panel ---------------- */
-function ringSVG(score) {
+function ringSVG(score, extraCls) {
   const C = 2 * Math.PI * 44, off = C * (1 - score / 100);
-  return `<div class="ring"><svg width="104" height="104" viewBox="0 0 104 104">
+  return `<div class="ring${extraCls || ""}"><svg width="104" height="104" viewBox="0 0 104 104">
     <circle cx="52" cy="52" r="44" fill="none" stroke="#e3e9f0" stroke-width="10"/>
     <circle cx="52" cy="52" r="44" fill="none" stroke="${barColor(score)}" stroke-width="10"
       stroke-linecap="round" stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}"/></svg>
@@ -394,16 +460,30 @@ function renderSide() {
   const el = $("side-panel");
   if (!a) { el.innerHTML = `<p style="color:var(--muted)">Select an asset on the grid.</p>`; return; }
   const s = a.sensors_raw, gi = a.grid_impact;
+  // Live-change tracking: snapshot this render's key values and compare
+  // against the previous render — components whose backend values moved get
+  // a brief highlight so the operator sees the side panel react.
+  const w = a.weather_raw;
+  const cur = {
+    status: a.status, risk: a.overall_risk,
+    temp: s.top_oil_temp_c, hotspot: s.winding_hot_spot_c, vib: s.vibration_mm_s,
+    oil: s.oil_dielectric_kv, pd: s.partial_discharge_pc, load: s.load_factor_current,
+    wmax: w.max_temp_c, wmin: w.min_temp_c,
+    precip: w.precipitation_mm, wind: w.wind_speed_max_kmh,
+  };
+  const prev = (S._lastSideVals && S._lastSideVals[a.id]) || {};
+  const ch = (key) => (prev[key] !== undefined && prev[key] !== cur[key]) ? " just-changed" : "";
+  S._lastSideVals = { ...(S._lastSideVals || {}), [a.id]: cur };
   const tabs = ["overview", "sensors", "weather", "history"]
     .map((t) => `<button data-t="${t}" class="${S.sideTab === t ? "active" : ""}">${cap(t === "sensors" ? "Sensor Data" : t)}</button>`).join("");
   let body = "";
   if (S.sideTab === "overview") {
-    body = `<div class="ring-row">${ringSVG(a.overall_risk)}
+    body = `<div class="ring-row">${ringSVG(a.overall_risk, ch("risk"))}
       <div class="sensor-rows">
-        <div class="sr"><span>Temperature</span><span class="val ${riskClass(a.sensors_norm.temperature_score)}">${s.top_oil_temp_c} °C</span></div>
-        <div class="sr"><span>Vibration</span><span class="val ${riskClass(a.sensors_norm.vibration_score)}">${vibLabel(a)}</span></div>
-        <div class="sr"><span>Oil Quality</span><span class="val ${riskClass(a.sensors_norm.oil_quality_score)}">${oilLabel(a)}</span></div>
-        <div class="sr"><span>Load</span><span class="val ${s.load_factor_current >= 0.85 ? "bad" : s.load_factor_current >= 0.7 ? "warn" : "ok"}">${Math.round(s.load_factor_current * 100)}%</span></div>
+        <div class="sr"><span>Temperature</span><span class="val ${riskClass(a.sensors_norm.temperature_score)}${ch("temp")}">${s.top_oil_temp_c} °C</span></div>
+        <div class="sr"><span>Vibration</span><span class="val ${riskClass(a.sensors_norm.vibration_score)}${ch("vib")}">${vibLabel(a)}</span></div>
+        <div class="sr"><span>Oil Quality</span><span class="val ${riskClass(a.sensors_norm.oil_quality_score)}${ch("oil")}">${oilLabel(a)}</span></div>
+        <div class="sr"><span>Load</span><span class="val ${s.load_factor_current >= 0.85 ? "bad" : s.load_factor_current >= 0.7 ? "warn" : "ok"}${ch("load")}">${Math.round(s.load_factor_current * 100)}%</span></div>
       </div></div>
       <div class="alert-box ${a.status}"><b>${alertTitle(a)}</b>${esc(alertText(a))}</div>
       <div class="impact"><b>Potential Impact</b>
@@ -413,23 +493,23 @@ function renderSide() {
       </div>`;
   } else if (S.sideTab === "sensors") {
     body = `<div class="sensor-rows">` + [
-      ["Top-oil temp", `${s.top_oil_temp_c} °C`, a.sensors_norm.temperature_score, "alarm 98 °C"],
-      ["Hot-spot winding", `${s.winding_hot_spot_c} °C`, a.sensors_norm.temperature_score, "alarm 128 °C"],
-      ["Vibration", `${s.vibration_mm_s} mm/s`, a.sensors_norm.vibration_score, "alarm 4.5 mm/s"],
-      ["Oil dielectric", `${s.oil_dielectric_kv} kV`, a.sensors_norm.oil_quality_score, "new ≥ 70 kV · fail < 30 kV"],
-      ["Partial discharge", `${fmtInt(s.partial_discharge_pc)} pC`, a.sensors_norm.partial_discharge_score, "alarm > 1000 pC"],
-      ["Current load factor", `${Math.round(s.load_factor_current * 100)}%`, null, "of rated capacity"],
-    ].map(([k, v, n, h]) => `<div class="sr"><span>${k}<br><small style="color:var(--faint)">${h}</small></span>
-      <span class="val ${n == null ? "" : riskClass(n)}">${v}${n == null ? "" : `<br><small>score ${n}</small>`}</span></div>`).join("") + `</div>`;
+      ["Top-oil temp", `${s.top_oil_temp_c} °C`, a.sensors_norm.temperature_score, "alarm 98 °C", ch("temp")],
+      ["Hot-spot winding", `${s.winding_hot_spot_c} °C`, a.sensors_norm.temperature_score, "alarm 128 °C", ch("hotspot")],
+      ["Vibration", `${s.vibration_mm_s} mm/s`, a.sensors_norm.vibration_score, "alarm 4.5 mm/s", ch("vib")],
+      ["Oil dielectric", `${s.oil_dielectric_kv} kV`, a.sensors_norm.oil_quality_score, "new ≥ 70 kV · fail < 30 kV", ch("oil")],
+      ["Partial discharge", `${fmtInt(s.partial_discharge_pc)} pC`, a.sensors_norm.partial_discharge_score, "alarm > 1000 pC", ch("pd")],
+      ["Current load factor", `${Math.round(s.load_factor_current * 100)}%`, null, "of rated capacity", ch("load")],
+    ].map(([k, v, n, h, c]) => `<div class="sr"><span>${k}<br><small style="color:var(--faint)">${h}</small></span>
+      <span class="val ${n == null ? "" : riskClass(n)}${c || ""}">${v}${n == null ? "" : `<br><small>score ${n}</small>`}</span></div>`).join("") + `</div>`;
   } else if (S.sideTab === "weather") {
-    const w = a.weather_raw, n = a.weather_norm;
+    const n = a.weather_norm;
     body = `<div class="sensor-rows">` + [
-      ["Max / min temp", `${w.max_temp_c} / ${w.min_temp_c} °C`, n.temperature_stress_score],
-      ["Precipitation", `${w.precipitation_mm} mm`, n.precipitation_score],
-      ["Max wind", `${w.wind_speed_max_kmh} km/h`, n.wind_storm_score],
-      ["Storm warning", `Level ${w.storm_warning_level} / 3`, null],
-      ["Forecast window", `${w.forecast_hours} h`, null],
-    ].map(([k, v, sc]) => `<div class="sr"><span>${k}</span><span class="val ${sc == null ? "" : riskClass(sc)}">${v}${sc == null ? "" : `<br><small>score ${sc}</small>`}</span></div>`).join("") + `</div>`;
+      ["Max / min temp", `${w.max_temp_c} / ${w.min_temp_c} °C`, n.temperature_stress_score, ch("wmax") || ch("wmin")],
+      ["Precipitation", `${w.precipitation_mm} mm`, n.precipitation_score, ch("precip")],
+      ["Max wind", `${w.wind_speed_max_kmh} km/h`, n.wind_storm_score, ch("wind")],
+      ["Storm warning", `Level ${w.storm_warning_level} / 3`, null, ""],
+      ["Forecast window", `${w.forecast_hours} h`, null, ""],
+    ].map(([k, v, sc, c]) => `<div class="sr"><span>${k}</span><span class="val ${sc == null ? "" : riskClass(sc)}${c || ""}">${v}${sc == null ? "" : `<br><small>score ${sc}</small>`}</span></div>`).join("") + `</div>`;
   } else {
     const h = a.history, d = a.degradation, lc = a.lifecycle;
     body = `<div class="sensor-rows">
@@ -445,7 +525,7 @@ function renderSide() {
   }
   el.innerHTML = `
     <div class="sp-head"><span class="sp-id-ico" aria-hidden="true">${TYPE_ICON[a.asset_type] || ICON_TX}</span>
-      <span class="aid">${esc(a.id)}</span><span class="status-pill ${a.status}">◉ ${riskWord(a)}</span></div>
+      <span class="aid">${esc(a.id)}</span><span class="status-pill ${a.status}${ch("status")}">◉ ${riskWord(a)}</span></div>
     <div class="sp-sub">${esc(cap(a.asset_type))} &nbsp;|&nbsp; ${esc(a.substation)} · ${esc(a.region)} Zone</div>
     <div class="sp-tabs">${tabs}</div>${body}
     <div class="sp-actions">
@@ -542,23 +622,117 @@ function renderAssetsTable() {
 /* ---------------- maintenance view ---------------- */
 function renderPlan() {
   const p = S.priorities;
-  $("plan-meta").textContent = `Ranked by overall risk, grid-impact tie-break · generated from live engine scores · ${new Date(p.generated_at).toLocaleString()}`;
-  $("plan-tbody").innerHTML = p.maintenance_plan.map((r) => `<tr data-id="${r.asset_id}">
-    <td><b>#${r.rank}</b></td><td><b>${r.asset_id}</b><br><small style="color:var(--faint)">${esc(r.substation)}</small></td>
-    <td><span class="status-pill ${r.status}">${r.status}</span></td>
-    <td style="font-family:var(--mono);font-weight:700">${r.overall_risk}</td>
-    <td style="font-family:var(--mono)">${fmtInt(r.customers_served)}</td>
-    <td>${r.has_redundant_path ? "N-1 ✓" : "<b style='color:var(--red)'>none</b>"}</td>
-    <td><b>${esc(r.recommended_action)}</b><br><small style="color:var(--muted)">${esc(r.action_detail)}</small></td>
-    <td><button class="linklike" data-open="${r.asset_id}">Details ›</button></td></tr>`).join("");
-  bindOpenButtons($("plan-tbody"));
-  $("crew-list").innerHTML = p.crew_prepositioning.length ? p.crew_prepositioning.map((c) => `
-    <div class="panel crew-card"><h3>⛑ ${esc(c.region)} Zone staging</h3><p>${esc(c.reason)}</p>
+  if (!p) {
+    $("plan-meta").textContent = "Loading…";
+    $("plan-tbody").innerHTML = `<tr><td colspan="9" class="empty-cell">Maintenance plan loading…</td></tr>`;
+    $("crew-list").innerHTML = "";
+    return;
+  }
+
+  const isSimPlan = p.simulation_phase != null;
+  const pendingApproval = p.pending_approval === true;
+
+  // Maintenance meta description
+  let metaText = `Ranked by risk + grid impact · ${new Date(p.generated_at).toLocaleString()}`;
+  if (isSimPlan) metaText += ` · Simulation: ${esc(p.simulation_phase)}`;
+  if (p.approved) metaText += ` · ✓ Approved by ${esc(p.approved_by)}`;
+  $("plan-meta").textContent = metaText;
+
+  // Simulation plan notice — the "Priority updated by simulation" status.
+  // Counts and reasons come from the backend task_changes + change_summary.
+  const planNotice = $("sim-plan-notice");
+  if (planNotice) {
+    if (isSimPlan && pendingApproval) {
+      planNotice.hidden = false;
+      const deltas = p.task_changes || [];
+      const nUp = deltas.filter((c) => c.moved_up).length;
+      const nEsc = deltas.filter((c) => c.newly_high_critical).length;
+      let head = `⚠ <b>Priority updated by simulation</b> — ${esc(p.simulation_phase)}. `;
+      head += deltas.length
+        ? `${deltas.length} item${deltas.length === 1 ? "" : "s"} changed` +
+          `${nUp ? ` (${nUp} promoted)` : ""}${nEsc ? `, ${nEsc} newly high/critical` : ""}.`
+        : "Priorities reordered from live engine scores.";
+      const sched = (p.change_summary || []).length
+        ? `<br><small>Scheduler: ${p.change_summary.map(esc).join("; ")}.</small>` : "";
+      planNotice.innerHTML = head + sched;
+    } else if (isSimPlan && p.approved) {
+      planNotice.hidden = false;
+      planNotice.innerHTML = `✓ <b>Simulation plan approved</b> (${esc(p.approved_by)} · ${new Date(p.approved_at).toLocaleString()})`;
+    } else {
+      planNotice.hidden = true;
+    }
+  }
+
+  // FLIP preparation: record row positions BEFORE the re-render so rank
+  // reordering can be animated (rows that moved slide to their new slot).
+  const tbody = $("plan-tbody");
+  const prevTops = new Map();
+  tbody.querySelectorAll("tr[data-id]").forEach((tr) => prevTops.set(tr.dataset.id, tr.getBoundingClientRect().top));
+
+  const deltaById = new Map((p.task_changes || []).map((c) => [c.asset_id, c]));
+  tbody.innerHTML = (p.maintenance_plan || []).map((r) => {
+    const ch = deltaById.get(r.asset_id);
+    const reordered = r.reordered === true;
+    // Row highlight priority: new escalation > status change > rank move.
+    let rowClass = "";
+    if (ch && ch.newly_high_critical) rowClass = "plan-row-escalated";
+    else if (ch && ch.status_from !== ch.status_to) rowClass = "plan-row-status";
+    else if (ch && ch.moved_up) rowClass = "plan-row-moved-up";
+    else if (ch && ch.moved_down) rowClass = "plan-row-moved-down";
+    else if (reordered) rowClass = "plan-row-reordered";
+    const rankBadge = (ch && ch.rank_from !== ch.rank_to)
+      ? ` <span class="rank-delta ${ch.moved_up ? "up" : "down"}" title="Was #${ch.rank_from} before the simulation update">${ch.moved_up ? "▲" : "▼"}${Math.abs(ch.rank_delta)}</span>`
+      : "";
+    const crewChanged = ch && (ch.crew_from || null) !== (ch.crew_to || null);
+    const crew = r.assigned_crew
+      ? `<span class="plan-crew-tag${crewChanged ? " crew-changed" : ""}"${crewChanged ? ` title="Reassigned by scheduler (was ${esc(ch.crew_from || "unassigned")})"` : ""}>${esc(r.assigned_crew)}</span>`
+      : `<span style="color:var(--faint)">—</span>`;
+    // Scheduler urgency (present on simulation-plan rows); highlighted when
+    // the backend scheduler changed it.
+    const urgChanged = ch && ch.urgency_from !== ch.urgency_to;
+    const urg = r.urgency
+      ? `<br><span class="urgency ${esc(r.urgency)}${urgChanged ? " urg-changed" : ""}"${urgChanged ? ` title="Urgency changed by scheduler (was ${esc(ch.urgency_from)})"` : ` title="Scheduler urgency"`}>${esc(r.urgency)}</span>`
+      : "";
+    // "Priority updated by simulation" reason line with scheduler factors.
+    const reacted = ch && (ch.moved_up || ch.moved_down || ch.status_from !== ch.status_to || urgChanged || crewChanged);
+    const reason = (reacted && ch.scheduling_reason)
+      ? `<span class="plan-reason">⚡ Priority updated by simulation — ${esc(ch.scheduling_reason)}</span>`
+      : "";
+    return `<tr data-id="${r.asset_id}"${rowClass ? ` class="${rowClass}"` : ""}>
+      <td><b>#${r.rank}</b>${rankBadge}</td>
+      <td><b>${r.asset_id}</b><br><small style="color:var(--faint)">${esc(r.substation)}</small></td>
+      <td><span class="status-pill ${r.status}">${r.status}</span></td>
+      <td style="font-family:var(--mono);font-weight:700">${r.overall_risk}</td>
+      <td style="font-family:var(--mono)">${fmtInt(r.customers_served)}</td>
+      <td>${r.has_redundant_path ? "N-1 ✓" : "<b style='color:var(--red)'>none</b>"}</td>
+      <td><b>${esc(r.recommended_action)}</b><br><small style="color:var(--muted)">${esc(r.action_detail)}</small>${urg}${reason}</td>
+      <td>${crew}</td>
+      <td><button class="linklike" data-open="${r.asset_id}">Details ›</button></td>
+    </tr>`;
+  }).join("");
+  bindOpenButtons(tbody);
+  // FLIP: slide rows that changed vertical position to their new slot.
+  tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+    const old = prevTops.get(tr.dataset.id);
+    if (old == null) return;
+    const dy = old - tr.getBoundingClientRect().top;
+    if (Math.abs(dy) < 4) return;
+    tr.style.transform = `translateY(${dy}px)`;
+    tr.style.transition = "none";
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      tr.style.transition = "transform .5s cubic-bezier(.2,.7,.25,1)";
+      tr.style.transform = "";
+      setTimeout(() => { tr.style.transition = ""; tr.style.transform = ""; }, 550);
+    }));
+  });
+  $("crew-list").innerHTML = (p.crew_prepositioning || []).length ? (p.crew_prepositioning || []).map((c) => `
+    <div class="panel crew-card"><h3>${SVG_CREW} ${esc(c.region)} Zone staging</h3><p>${esc(c.reason)}</p>
     <div class="chips">${c.assets.map((id) => {
       const a = S.assets.find((x) => x.id === id);
+      if (!a) return `<span class="chip">${esc(id)}</span>`;
       return `<span class="chip ${a.status}">${id} · ${a.overall_risk}</span>`;
     }).join("")}</div></div>`).join("")
-    : `<div class="panel crew-card"><h3>⛑ No staging required</h3><p>No weather-exposed, high-consequence assets right now.</p></div>`;
+    : `<div class="panel crew-card"><h3>${SVG_CREW} No staging required</h3><p>No weather-exposed, high-consequence assets right now.</p></div>`;
 }
 function bindOpenButtons(root) {
   root.querySelectorAll("[data-open]").forEach((b) => b.onclick = (e) => { e.stopPropagation(); openModal(b.dataset.open); });
@@ -566,9 +740,11 @@ function bindOpenButtons(root) {
 }
 
 /* ---------------- modal ---------------- */
-function openModal(id) {
+/* Asset detail body — a pure render of backend state, re-runnable so an open
+   record stays in sync with live simulation scores without stealing focus. */
+function renderModalBody(id) {
   const a = S.assets.find((x) => x.id === id);
-  if (!a) return;
+  if (!a) return false;
   const lc = a.lifecycle, h = a.history, d = a.degradation, gi = a.grid_impact, s = a.sensors_raw;
   // Order bars by weighted contribution (score × engine weight) so the
   // top bar always matches the backend's dominant_factor.
@@ -625,9 +801,16 @@ function openModal(id) {
       <button class="btn primary" id="m-ask">✦ Ask AI about ${a.id}</button>
       <button class="btn ghost" id="m-maint">Schedule Maintenance</button>
     </div>`;
-  $("modal-backdrop").classList.remove("hidden");
   $("m-ask").onclick = () => { closeModal(); gotoAI(`Why is ${a.id} ${a.status.toLowerCase()}?`, a.id); };
   $("m-maint").onclick = () => openConfirm(a.id);
+  return true;
+}
+/* Open the asset modal (records which asset is open so live simulation
+   refreshes can keep its numbers in sync). */
+function openModal(id) {
+  if (!renderModalBody(id)) return;
+  S._modalAsset = id;
+  $("modal-backdrop").classList.remove("hidden");
   S._lastFocus = document.activeElement;
   const closeBtn = $("modal-close");
   if (closeBtn) closeBtn.focus();
@@ -643,6 +826,7 @@ function trapTab(e, container) {
 }
 function closeModal() {
   $("modal-backdrop").classList.add("hidden");
+  S._modalAsset = null;
   if (S._lastFocus && S._lastFocus.focus) { try { S._lastFocus.focus(); } catch (e) {} S._lastFocus = null; }
 }
 
@@ -686,7 +870,7 @@ function openHelp(kind) {
       eyebrow: "GRID STATUS",
       title: "Read the network at a glance",
       lead: "Use this view to spot risk, inspect an asset, and understand where operational attention is needed.",
-      steps: [["Filter the fleet", "Search by asset ID, status, region, or asset type. The map and attention queue update together."], ["Read the health scale", "Green means healthy, yellow means monitoring, orange means high risk, and red means critical."], ["Inspect a node", "Activate a transformer or substation (Enter) for live details. Double-click it for the full asset record."], ["Navigate the map", "Use +, minus, Reset, or your mouse wheel to zoom into the network."], ["Move to action", "Use the Maintenance view when an asset needs a ranked response plan."]]
+      steps: [["Filter the fleet", "Search by asset ID, status, region, or asset type. The map and attention queue update together."], ["Read the health scale", "Green means healthy, yellow means monitoring, orange means high risk, and red means critical."], ["Watch live changes", "During a simulation, a flashing ring marks an asset whose risk just changed, a halo marks one that keeps deteriorating, and the banner feed lists every transition."], ["Inspect a node", "Activate a transformer or substation (Enter) for live details. Double-click it for the full asset record."], ["Navigate the map", "Use +, minus, Reset, or your mouse wheel to zoom into the network."], ["Move to action", "Use the Maintenance view when an asset needs a ranked response plan."]]
     },
     assets: {
       eyebrow: "ASSET REGISTER",
@@ -998,9 +1182,12 @@ function badge() {
 }
 function startClock() {
   const tick = () => { $("live-clock").textContent = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }); };
-  tick(); setInterval(tick, 15000);
+  tick(); setInterval(tick, 1000);
 }
 function renderAll() {
+  // Inject nav SVG icons into the static HTML tab spans
+  const _ti = { overview: NAV_ICON_OVERVIEW, assets: NAV_ICON_ASSETS, maintenance: NAV_ICON_MAINT, ai: NAV_ICON_AI };
+  Object.entries(_ti).forEach(([k, svg]) => { const el = document.getElementById("ti-" + k); if (el) el.innerHTML = svg; });
   renderKPIs(); renderMap(); renderSide(); renderQueue(); renderStrips();
   renderAssetsTable(); renderPlan(); renderFilterMeta();
   if (S.briefing && S.briefing.offline) $("offline-banner").hidden = false;
@@ -1057,4 +1244,468 @@ function renderAll() {
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal(); closeHelp(); closeConfirm(); } });
 }
 
-document.addEventListener("DOMContentLoaded", init);
+/* ============================================================
+   SIMULATION LAYER — SCENARIO RUNNER
+   Autonomous timed simulation.  The backend drives all scoring
+   and runs the ScenarioRunner; this JS polls /api/scenario/tick
+   every 2.5 seconds while running and reflects the state.
+   ============================================================ */
+
+const SIM = {
+  active: false,
+  scenarioActive: false,
+  scenarioId: null,
+  scenarioLabel: null,
+  phase: null,
+  phaseIndex: null,
+  phaseLabel: null,
+  phaseDesc: null,
+  totalPhases: 0,
+  stepIndex: null,
+  totalSteps: null,
+  stepProgress: 0,
+  stepElapsedS: 0,
+  stepDurationS: 0,
+  elapsedS: 0,
+  running: false,
+  paused: false,
+  completed: false,
+  planPending: false,
+  planApproved: false,
+  liveWeather: false,
+  _pollTimer: null,
+  // Live-change visualisation (all derived from backend `changes` events):
+  // flash maps asset_id -> one-shot marker class consumed by renderMap();
+  // events is the recent-event feed rendered into the banner.
+  flash: {},
+  events: [],
+};
+
+// All available scenarios loaded from the backend
+const SIM_SCENARIOS = { list: [], default: "storm_surge" };
+
+async function simApi(path, body) {
+  const opts = body != null
+    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    : { method: "POST" };
+  try {
+    const r = await fetch(path, opts);
+    if (!r.ok) return null;
+    return r.json();
+  } catch (e) { return null; }
+}
+
+// ── Live-change visualisation ───────────────────────────────────────────────
+// Backend `changes` events (per-asset transitions between scoring snapshots)
+// drive three UI reactions: a one-shot marker flash on the map, an operator
+// event feed in the banner, and a toast for newly elevated priorities.
+// Nothing here invents data — it only visualises the backend diff.
+
+function queueSimFlashes(changes) {
+  SIM.flash = SIM.flash || {};
+  (changes || []).forEach((ch) => {
+    if (!ch || !ch.asset_id) return;
+    let cls = null;
+    if (ch.newly_high_critical) {
+      cls = "flash-escalated";
+    } else if (ch.cleared_alert || (ch.band_change && ch.direction === "falling")) {
+      cls = "flash-improved";
+    } else if (ch.band_change || Math.abs(ch.risk_delta || 0) >= 0.5) {
+      cls = "flash-changed";
+    }
+    if (!cls) return;
+    // Escalation wins if several transitions queued for the same marker.
+    if (SIM.flash[ch.asset_id] !== "flash-escalated") SIM.flash[ch.asset_id] = cls;
+  });
+}
+
+function pushSimEvents(changes) {
+  SIM.events = SIM.events || [];
+  (changes || []).forEach((ch) => {
+    if (!ch || !ch.asset_id) return;
+    // Latest-wins per asset: a new transition updates that asset's row in
+    // place instead of appending a duplicate, so the feed stays readable
+    // when several ticks in a row move the same assets.
+    SIM.events = SIM.events.filter((e) => e.id !== ch.asset_id);
+    SIM.events.push({
+      id: ch.asset_id,
+      from: ch.previous_status,
+      to: ch.new_status,
+      oldRisk: ch.previous_risk,
+      newRisk: ch.new_risk,
+      delta: ch.risk_delta,
+      dir: ch.direction,
+      esc: ch.newly_high_critical,
+      improved: ch.cleared_alert,
+      band: ch.band_change,
+      driver: ch.dominant_factor_label,
+    });
+    if (ch.newly_high_critical) {
+      toast(`⚠ ${ch.asset_id} elevated to ${ch.new_status} (${ch.previous_risk} → ${ch.new_risk})`);
+    }
+  });
+  if (SIM.events.length > 8) SIM.events = SIM.events.slice(-8);
+}
+
+function renderSimEvents() {
+  const el = $("sim-change-summary");
+  if (!el) return;
+  if (!SIM.active || !SIM.events || !SIM.events.length) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  el.hidden = false;
+  // Freshness heartbeat: wall-clock time of the last poll plus whether that
+  // update carried transitions ("steady" when the engine re-scored nothing
+  // new). Refreshed on every poll so the section is visibly alive even
+  // during quiet stretches between storm ramps.
+  const tickTime = SIM.lastTickAt
+    ? new Date(SIM.lastTickAt).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "";
+  const meta = tickTime
+    ? `updated ${esc(tickTime)} · ${SIM.lastChangeCount ? SIM.lastChangeCount + " new" : "steady"}`
+    : "";
+  el.innerHTML = `<div class="ev-head"><b><span class="ev-live" aria-hidden="true"></span>Live changes — backend risk state</b>` +
+    (meta ? `<span class="ev-meta">${meta}</span>` : "") + `</div><ul class="sim-events">` +
+    SIM.events.slice(-6).reverse().map((e) => {
+      const arrow = e.dir === "rising" ? "▲" : e.dir === "falling" ? "▼" : "•";
+      const dcls = e.dir === "rising" ? "ev-up" : e.dir === "falling" ? "ev-down" : "ev-flat";
+      const band = e.from !== e.to
+        ? `<span class="ev-band">${esc(e.from)} → ${esc(e.to)}</span>`
+        : `<span>${esc(e.to)}</span>`;
+      const tag = e.esc ? `<span class="ev-new">NEW ${esc(e.to).toUpperCase()} PRIORITY</span>` : "";
+      return `<li><span class="ev-id">${esc(e.id)}</span>${band}` +
+        `<span class="${dcls}">${arrow} ${e.oldRisk} → ${e.newRisk}</span>` +
+        `<span class="ev-driver">${esc(e.driver || "")}</span>${tag}</li>`;
+    }).join("") + `</ul>`;
+}
+
+// ── Scenario run / control ────────────────────────────────────────────────────
+
+async function simLaunch() {
+  // Show the scenario selector and let the operator choose, then Run
+  const wrap = $("sim-scenario-select-wrap");
+  if (wrap) wrap.hidden = false;
+  const sel = $("sim-scenario-select");
+  // Populate if not already done
+  if (sel && sel.options.length === 0 && SIM_SCENARIOS.list.length > 0) {
+    sel.innerHTML = SIM_SCENARIOS.list.map((s) =>
+      `<option value="${esc(s.id)}">${esc(s.label)}</option>`
+    ).join("");
+    sel.value = SIM_SCENARIOS.default;
+  }
+  // Start simulation with the default/first scenario
+  await simRun();
+}
+
+async function simRun() {
+  const sel = $("sim-scenario-select");
+  const scenarioId = (sel && sel.value) || SIM_SCENARIOS.default || "storm_surge";
+  const data = await simApi("/api/scenario/run", { scenario_id: scenarioId });
+  if (!data || data.error) {
+    toast(data ? `Simulation error: ${data.error}` : "Could not start simulation — backend unreachable");
+    return;
+  }
+  applySimState(data);
+  await refreshSimData();
+  renderSimEvents();
+  switchView("maintenance");
+  simStartPolling();
+  toast(`Scenario started: ${data.scenario_label || scenarioId}`);
+}
+
+async function simPause() {
+  const data = await simApi("/api/scenario/pause");
+  if (!data) { toast("Backend unreachable"); return; }
+  applySimState(data);
+  renderSimEvents();
+}
+
+async function simResume() {
+  const data = await simApi("/api/scenario/resume");
+  if (!data) { toast("Backend unreachable"); return; }
+  applySimState(data);
+  renderSimEvents();
+  simStartPolling();
+}
+
+async function simReset() {
+  simStopPolling();
+  const data = await simApi("/api/scenario/reset");
+  if (!data) { toast("Backend unreachable"); return; }
+  applySimState({ active: false });
+  renderSimEvents();
+  await refreshAllData();
+  toast("Simulation reset — static demo data restored");
+}
+
+async function simStop() {
+  simStopPolling();
+  const data = await simApi("/api/simulation/stop");
+  if (!data) { toast("Backend unreachable"); return; }
+  applySimState({ active: false });
+  renderSimEvents();
+  await refreshAllData();
+  toast("Simulation stopped — static demo data restored");
+}
+
+async function simApprovePlan() {
+  const data = await simApi("/api/simulation/approve", { approved_by: "operator" });
+  if (!data || data.error) { toast(data ? data.error : "Backend unreachable"); return; }
+  SIM.planPending = false;
+  SIM.planApproved = true;
+  renderSimBanner();
+  await refreshSimPlan();
+  toast(`Maintenance plan approved (${data.tasks} tasks) — crew plan updated`);
+}
+
+async function simRejectPlan() {
+  const data = await simApi("/api/simulation/reject");
+  if (!data) { toast("Backend unreachable"); return; }
+  SIM.planPending = false;
+  renderSimBanner();
+  toast("Pending plan rejected — previous plan retained");
+}
+
+// ── Auto-poll loop ────────────────────────────────────────────────────────────
+
+function simStartPolling() {
+  simStopPolling();
+  SIM._pollTimer = setInterval(simPoll, 2500);
+}
+
+function simStopPolling() {
+  if (SIM._pollTimer != null) {
+    clearInterval(SIM._pollTimer);
+    SIM._pollTimer = null;
+  }
+}
+
+async function simPoll() {
+  if (!SIM.active) { simStopPolling(); return; }
+  try {
+    const data = await fetch("/api/scenario/tick").then((r) => r.ok ? r.json() : null);
+    if (!data) return;
+    applySimState(data);
+    // If pressure/phase changed, also refresh assets
+    if (data.running) {
+      await refreshSimData();
+    }
+    renderSimEvents();
+    if (data.completed && !SIM._completedNotified) {
+      SIM._completedNotified = true;
+      simStopPolling();
+      toast(`Scenario complete: ${SIM.scenarioLabel || "simulation"}`);
+    }
+  } catch (e) { /* keep existing state on network error */ }
+}
+
+// ── State application ─────────────────────────────────────────────────────────
+
+function applySimState(data) {
+  if (!data) return;
+  const wasActive = SIM.active;
+  SIM.active = data.active || false;
+  if (!SIM.active) {
+    SIM.flash = {};
+    SIM.events = [];
+    SIM.lastTickAt = null;
+    SIM.lastChangeCount = 0;
+  } else {
+    SIM.lastTickAt = Date.now();
+    SIM.lastChangeCount = (data.changes || []).length;
+    queueSimFlashes(data.changes);
+    pushSimEvents(data.changes);
+  }
+  SIM.scenarioActive = data.scenario_active || false;
+  SIM.scenarioId = data.scenario_id || null;
+  SIM.scenarioLabel = data.scenario_label || null;
+  SIM.phase = data.phase || null;
+  SIM.phaseIndex = data.phase_index != null ? data.phase_index : null;
+  SIM.phaseLabel = data.phase_label || null;
+  SIM.phaseDesc = data.phase_description || null;
+  SIM.totalPhases = data.total_phases || 0;
+  SIM.stepIndex = data.step_index != null ? data.step_index : null;
+  SIM.totalSteps = data.total_steps != null ? data.total_steps : null;
+  SIM.stepProgress = data.step_progress || 0;
+  SIM.stepElapsedS = data.step_elapsed_s || 0;
+  SIM.stepDurationS = data.step_duration_s || 0;
+  SIM.elapsedS = data.elapsed_s || 0;
+  SIM.running = data.running || false;
+  SIM.paused = data.paused || false;
+  SIM.completed = data.completed || false;
+  SIM.planPending = data.plan_pending_approval || false;
+  SIM.planApproved = data.plan_approved || false;
+  SIM.liveWeather = data.live_weather_base || false;
+  SIM._completedNotified = SIM._completedNotified && SIM.completed;
+  if (!SIM.active && wasActive) simStopPolling();
+  renderSimBanner();
+}
+
+function renderSimBanner() {
+  const banner = $("sim-banner");
+  if (!banner) return;
+  if (!SIM.active) {
+    banner.hidden = true;
+    const pw = $("sim-progress-wrap");
+    if (pw) pw.hidden = true;
+    return;
+  }
+  banner.hidden = false;
+
+  // Phase label + description
+  $("sim-phase-label").textContent = SIM.phaseLabel || "Simulation active";
+  const desc = document.querySelector("#sim-phase-desc");
+  if (desc) desc.textContent = SIM.phaseDesc || "";
+
+  // Scenario badge
+  const badge = $("sim-scenario-badge");
+  if (badge) {
+    if (SIM.scenarioLabel) {
+      badge.textContent = SIM.scenarioLabel;
+      badge.hidden = false;
+    } else {
+      badge.hidden = true;
+    }
+  }
+
+  // Step/phase counter
+  const counter = $("sim-phase-counter");
+  if (counter) {
+    if (SIM.scenarioActive && SIM.stepIndex != null && SIM.totalSteps) {
+      counter.textContent = `Step ${SIM.stepIndex + 1}/${SIM.totalSteps}`;
+    } else if (SIM.phaseIndex != null && SIM.totalPhases) {
+      counter.textContent = `Phase ${SIM.phaseIndex + 1}/${SIM.totalPhases}`;
+    } else {
+      counter.textContent = "";
+    }
+  }
+
+  // Progress bar
+  const pw = $("sim-progress-wrap");
+  if (pw) {
+    pw.hidden = !SIM.scenarioActive;
+    if (SIM.scenarioActive) {
+      const fill = $("sim-progress-fill");
+      const label = $("sim-progress-label");
+      if (fill) fill.style.width = `${Math.round((SIM.stepProgress || 0) * 100)}%`;
+      if (label) {
+        const pct = Math.round((SIM.stepProgress || 0) * 100);
+        const durS = SIM.stepDurationS || 0;
+        const remS = Math.max(0, Math.round(durS - (SIM.stepElapsedS || 0)));
+        label.textContent = SIM.completed
+          ? "✓ Scenario complete"
+          : SIM.paused ? `Paused · ${pct}%`
+          : `${pct}% · ~${remS}s remaining`;
+      }
+    }
+  }
+
+  // Animate the dot
+  const dot = $("sim-dot");
+  if (dot) {
+    dot.classList.toggle("sim-dot-pulse", SIM.running);
+    dot.classList.toggle("sim-dot-paused", SIM.paused);
+    dot.classList.toggle("sim-dot-done", SIM.completed);
+  }
+
+  // Run/Pause/Resume button visibility
+  const btnRun = $("sim-run");
+  const btnPause = $("sim-pause");
+  const btnResume = $("sim-resume");
+  if (btnRun) btnRun.hidden = SIM.running || SIM.paused || SIM.completed;
+  if (btnPause) btnPause.hidden = !SIM.running || SIM.completed;
+  if (btnResume) btnResume.hidden = !SIM.paused || SIM.completed;
+
+  // Approval bar
+  const approvalBar = $("sim-approval-bar");
+  if (approvalBar) approvalBar.hidden = !SIM.planPending;
+}
+
+async function refreshSimData() {
+  // Refresh assets + maintenance from live-simulation-adjusted backend data.
+  // While a simulation is active the maintenance view is served the
+  // deterministic scheduler plan (/api/simulation/plan: urgency, crew
+  // assignments, reorder flags, per-task deltas) instead of the plain
+  // static ranking — that is what makes the plan visibly react.
+  try {
+    const [d1, d2] = await Promise.all([
+      api("/api/assets"),
+      api(SIM.active ? "/api/simulation/plan" : "/api/priorities"),
+    ]);
+    S.assets = d1.assets;
+    if (d2 && d2.maintenance_plan) S.priorities = d2;
+  } catch (e) { /* keep existing */ }
+  refreshFiltered();
+  renderSide();       // keep the selected asset's detail in sync
+  renderPlan();
+  if (S._modalAsset && !$("modal-backdrop").classList.contains("hidden")) {
+    renderModalBody(S._modalAsset);  // no focus change — pure data sync
+  }
+  S._lastRisk = riskSnapshot(S.assets);
+}
+
+async function refreshSimPlan() {
+  try {
+    const plan = await api("/api/simulation/plan");
+    if (plan && plan.maintenance_plan) {
+      S.priorities = plan; renderPlan();
+    }
+  } catch (e) { /* keep existing */ }
+}
+
+async function refreshAllData() {
+  try {
+    const [d1, d2, d3] = await Promise.all([
+      api("/api/assets"), api("/api/summary"), api("/api/priorities"),
+    ]);
+    S.assets = d1.assets; S.summary = d2; S.priorities = d3;
+  } catch (e) { /* keep existing */ }
+  renderAll();
+  if (S._modalAsset && !$("modal-backdrop").classList.contains("hidden")) {
+    renderModalBody(S._modalAsset);
+  }
+  S._lastRisk = riskSnapshot(S.assets);
+}
+
+async function loadScenarios() {
+  try {
+    const data = await api("/api/scenario/list");
+    if (!data || !data.scenarios) return;
+    SIM_SCENARIOS.list = data.scenarios;
+    SIM_SCENARIOS.default = data.default || "storm_surge";
+    const sel = $("sim-scenario-select");
+    if (sel) {
+      sel.innerHTML = data.scenarios.map((s) =>
+        `<option value="${esc(s.id)}">${esc(s.label)}</option>`
+      ).join("");
+      sel.value = SIM_SCENARIOS.default;
+    }
+  } catch (e) { /* offline — use defaults */ }
+}
+
+function initSimControls() {
+  const launch = $("sim-launch");
+  if (launch) launch.onclick = simLaunch;
+  const run = $("sim-run");
+  if (run) run.onclick = simRun;
+  const pause = $("sim-pause");
+  if (pause) pause.onclick = simPause;
+  const resume = $("sim-resume");
+  if (resume) resume.onclick = simResume;
+  const reset = $("sim-reset");
+  if (reset) reset.onclick = simReset;
+  const stop = $("sim-stop");
+  if (stop) stop.onclick = simStop;
+  const approve = $("sim-approve");
+  if (approve) approve.onclick = simApprovePlan;
+  const reject = $("sim-reject");
+  if (reject) reject.onclick = simRejectPlan;
+  // Show scenario select on launch area click
+  const sel = $("sim-scenario-select-wrap");
+  const selEl = $("sim-scenario-select");
+  if (selEl) selEl.onchange = () => {};  // no-op; value used on simRun
+}
+
+document.addEventListener("DOMContentLoaded", () => { init(); initSimControls(); loadScenarios(); });

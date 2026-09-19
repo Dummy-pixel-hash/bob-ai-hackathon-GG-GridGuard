@@ -48,11 +48,15 @@ main{position:relative;z-index:1;max-width:1460px;margin:0 auto;padding:18px 22p
   border-bottom:1px solid var(--line-soft); box-shadow:var(--shadow)}
 .brand{display:inline-flex;align-items:center;min-width:0;color:var(--accent);
   background:none;border:0;padding:8px 6px;font:inherit;cursor:pointer;border-radius:8px}
+.brand-wrap{display:flex;flex-direction:column;align-items:flex-start;gap:1px}
 .brand-word{display:inline-flex;align-items:baseline;font-size:25px;line-height:1.1;letter-spacing:.2px}
+.brand-sub{font-size:10px;font-weight:500;letter-spacing:.3px;color:var(--muted);line-height:1;white-space:nowrap;opacity:.85}
 .bw-g{font-weight:800;color:var(--accent)}
 .bw-rest{display:inline-block;max-width:0;opacity:0;overflow:hidden;white-space:nowrap;
   font-weight:700;color:var(--accent);transition:max-width .3s ease,opacity .2s ease}
 .brand:hover .bw-rest,.brand:focus-visible .bw-rest{max-width:3.2em;opacity:1}
+.tab-icon{display:inline-flex;align-items:center;vertical-align:-.1em;margin-right:4px}
+.tab-icon svg{display:block}
 .tabs{display:flex;align-items:center;gap:22px;background:transparent;border:0;
   border-radius:0;padding:0}
 .tab{background:transparent;border:0;color:var(--muted);font-size:14.5px;font-weight:600;
@@ -197,6 +201,10 @@ select option{background:var(--panel);color:var(--text)}
   .node,.qcard,.kpi,.msg,.map-canvas{animation:none!important;transition:none!important}
   .bw-rest{transition:none!important}
   .node.pulse{animation:none!important}
+  .node.flash-changed::before,.node.flash-escalated::before,.node.flash-improved::before,
+  .node.deteriorating::after{animation:none!important;opacity:0!important}
+  .ev-live{animation:none!important}
+  .val.just-changed,.ring.just-changed,.status-pill.just-changed{animation:none!important}
   .typing-row span{animation:none!important;opacity:.6}
   .riskbar .fill,.fbar .fill{transition:none!important}
 }
@@ -527,3 +535,121 @@ details.m-card[open] summary{margin-bottom:10px}
   .sug{padding:10px 16px}
   .map-tool.map-reset{font-size:12px}
 }
+
+/* ---------- simulation banner & controls ---------- */
+.sim-banner{margin:14px 0 0;border:1px solid var(--border-info);border-radius:10px;
+  background:var(--surface-info);overflow:hidden}
+.sim-banner[hidden]{display:none}
+.sim-banner-inner{display:flex;align-items:center;justify-content:space-between;
+  gap:14px;padding:12px 16px;flex-wrap:wrap}
+.sim-phase-track{display:flex;align-items:center;gap:10px;min-width:0;flex:1}
+/* dot states: running = pulsing blue, paused = amber, done = green */
+.sim-dot{font-size:20px;color:var(--blue);flex:none;transition:color .3s}
+.sim-dot-pulse{animation:simpulse 2s infinite}
+.sim-dot-paused{animation:none;color:var(--orange);opacity:.85}
+.sim-dot-done{animation:none;color:var(--green);opacity:1}
+@keyframes simpulse{0%,100%{opacity:1}50%{opacity:.45}}
+.sim-text{min-width:0}
+.sim-text b{display:block;font-size:14px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sim-text span{font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
+.sim-controls{display:flex;align-items:center;gap:8px;flex:none;flex-wrap:wrap}
+.sim-counter{font-size:12.5px;font-family:var(--mono);color:var(--muted)}
+.sim-scenario-badge{font-size:11.5px;font-family:var(--mono);color:var(--blue);
+  padding:2px 7px;border:1px solid var(--border-info);border-radius:4px;
+  white-space:nowrap;max-width:200px;overflow:hidden;text-overflow:ellipsis}
+/* Run / Pause / Resume buttons — small solid teal */
+.sim-btn{padding:6px 14px;font-size:12.5px;background:var(--blue);color:#fff;
+  border:none;border-radius:6px;cursor:pointer;font-weight:600;transition:opacity .15s}
+.sim-btn:hover{opacity:.85}
+.btn-sm{padding:7px 13px;font-size:12.5px}
+/* Step progress bar */
+.sim-progress-wrap{display:flex;align-items:center;gap:10px;padding:6px 16px 10px;border-top:1px solid var(--line-faint)}
+.sim-progress-wrap[hidden]{display:none}
+.sim-progress-track{flex:1;height:6px;background:var(--line-faint);border-radius:3px;overflow:hidden}
+.sim-progress-fill{height:100%;background:var(--blue);border-radius:3px;transition:width .6s linear}
+.sim-progress-label{font-size:11.5px;font-family:var(--mono);color:var(--muted);white-space:nowrap;min-width:140px;text-align:right}
+/* scenario selector in head-actions */
+.sim-scenario-select-wrap{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted)}
+.sim-scenario-select-wrap[hidden]{display:none}
+.sim-scenario-label{white-space:nowrap;font-size:12px}
+#sim-scenario-select{font-size:12.5px;padding:5px 8px;border-radius:6px;
+  border:1px solid var(--border);background:var(--surface-faint);color:var(--text);
+  max-width:240px;cursor:pointer}
+.sim-approval-bar{display:flex;align-items:center;justify-content:space-between;
+  gap:12px;padding:10px 16px;background:var(--orange-dim);border-top:1px solid var(--border-high);
+  font-size:12.5px;flex-wrap:wrap}
+.sim-approval-bar[hidden]{display:none}
+.sim-approval-bar>div{display:flex;gap:8px;flex:none}
+.sim-change-summary{padding:8px 16px 12px;font-size:12.5px;color:var(--muted);border-top:1px solid var(--line-faint)}
+.sim-change-summary[hidden]{display:none}
+.sim-change-summary ul{margin:4px 0 0;padding-left:18px;display:grid;gap:3px}
+.sim-plan-notice{margin-bottom:12px;padding:11px 15px;border-radius:8px;font-size:12.5px;
+  background:var(--yellow-dim);border:1px solid var(--border-warn);color:var(--text)}
+.sim-plan-notice[hidden]{display:none}
+.head-actions{display:flex;align-items:center;gap:10px;flex:none;flex-wrap:wrap}
+/* highlight reordered rows in maintenance table */
+.plan-row-reordered{background:var(--yellow-dim)!important}
+.plan-row-reordered td:first-child::after{content:" ↑";color:var(--orange);font-weight:700;margin-left:4px}
+.plan-crew-tag{font-size:11.5px;color:var(--blue);font-family:var(--mono)}
+
+/* ---------- simulation live-change visuals (operator observability) ----------
+   One-shot flash rings ride on ::before (a separate layer) so the node's own
+   entrance/selection styling is never disturbed. The sustained
+   "deteriorating" halo rides on ::after. */
+.node::before,.node::after{content:"";position:absolute;border-radius:12px;pointer-events:none;opacity:0}
+.node.flash-changed::before{inset:-5px;border:2px solid var(--blue);animation:flashring 1.6s ease-out}
+.node.flash-improved::before{inset:-5px;border:2px solid var(--green);animation:flashring 1.6s ease-out}
+.node.flash-escalated::before{inset:-5px;border:3px solid var(--red);animation:escring 2.2s ease-out}
+.node.flash-escalated{border-color:var(--critical-edge)}
+@keyframes flashring{0%{opacity:0;box-shadow:0 0 0 0 rgba(31,78,134,.45)}15%{opacity:1}100%{opacity:0;box-shadow:0 0 0 10px rgba(31,78,134,0)}}
+@keyframes escring{0%{opacity:0;box-shadow:0 0 0 0 rgba(180,35,24,.5)}15%{opacity:1}60%{opacity:1}100%{opacity:0;box-shadow:0 0 0 16px rgba(180,35,24,0)}}
+.node.flash-changed .nrisk,.node.flash-escalated .nrisk,.node.flash-improved .nrisk{transition:color .8s}
+/* sustained halo while an asset's risk keeps climbing during simulation */
+.node.deteriorating::after{inset:-7px;border:2px solid var(--orange);opacity:1;animation:dethalo 2.2s ease-in-out infinite}
+.node.deteriorating.st-Critical::after{border-color:var(--red)}
+.node.deteriorating.st-Healthy::after,.node.deteriorating.st-Monitoring::after{border-color:var(--amber-strong)}
+@keyframes dethalo{0%,100%{box-shadow:0 0 0 0 rgba(180,83,9,.28)}50%{box-shadow:0 0 0 7px rgba(180,83,9,.06)}}
+/* legend swatches for the two live states */
+.dot.changed{background:var(--panel);border:2px solid var(--blue);width:7px;height:7px}
+.dot.deter{background:var(--panel);border:2px solid var(--orange);width:7px;height:7px}
+/* side-panel live-change highlights: components whose backend values moved
+   since the previous render get a brief halo so the operator sees the
+   side panel react mid-simulation (no layout shift — box-shadow only). */
+.val.just-changed{border-radius:5px;animation:valflash 1.8s ease-out}
+@keyframes valflash{0%{box-shadow:0 0 0 3px var(--accent-soft)}100%{box-shadow:0 0 0 0 transparent}}
+.ring.just-changed{animation:ringflash 1.8s ease-out}
+@keyframes ringflash{0%{transform:scale(1)}30%{transform:scale(1.07)}100%{transform:scale(1)}}
+.status-pill.just-changed{animation:valflash 1.8s ease-out}
+/* simulation event feed inside the banner */
+.ev-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+.ev-head b{display:inline-flex;align-items:center;gap:7px}
+.ev-live{width:8px;height:8px;border-radius:50%;background:var(--green);flex:none;animation:evpulse 2s infinite}
+@keyframes evpulse{0%,100%{opacity:1}50%{opacity:.35}}
+.ev-meta{font-size:11.5px;font-family:var(--mono);color:var(--muted);white-space:nowrap}
+.sim-events{display:grid;gap:4px;margin:8px 0 0;padding:0;list-style:none}
+.sim-events li{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:12px;font-family:var(--mono)}
+.sim-events .ev-id{font-weight:800;color:var(--text)}
+.sim-events .ev-band{font-weight:700;color:var(--text)}
+.sim-events .ev-up{color:var(--red);font-weight:700}
+.sim-events .ev-down{color:var(--green);font-weight:700}
+.sim-events .ev-flat{color:var(--muted);font-weight:700}
+.sim-events .ev-driver{color:var(--faint);font-family:var(--font)}
+.sim-events .ev-new{color:var(--red);font-weight:800}
+/* maintenance rows reacting to simulation deltas */
+.plan-row-moved-up{background:#edf5ef!important}
+.plan-row-moved-up td:first-child .rank-delta.up{margin-left:6px}
+.plan-row-moved-down{background:var(--yellow-dim)!important}
+.plan-row-status{box-shadow:inset 4px 0 0 var(--blue)}
+.plan-row-escalated{background:var(--red-dim)!important}
+.rank-delta{font-size:11px;font-weight:800;font-family:var(--mono);padding:1px 7px;border-radius:10px;margin-left:6px;white-space:nowrap}
+.rank-delta.up{color:var(--green);background:var(--panel);border:1px solid var(--border-ok)}
+.rank-delta.down{color:var(--orange);background:var(--panel);border:1px solid var(--border-high)}
+.urgency{display:inline-block;font-size:10.5px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;
+  padding:2px 8px;border-radius:10px;margin-top:4px}
+.urgency.immediate{color:var(--red);background:var(--panel);border:1px solid var(--border-bad)}
+.urgency.priority{color:var(--orange);background:var(--panel);border:1px solid var(--border-high)}
+.urgency.routine{color:var(--yellow);background:var(--panel);border:1px solid var(--border-warn)}
+.urgency.monitor{color:var(--muted);background:var(--surface-chip);border:1px solid var(--line-soft)}
+.urgency.urg-changed{outline:2px solid var(--blue);outline-offset:1px}
+.plan-crew-tag.crew-changed{outline:2px solid var(--blue);outline-offset:2px;border-radius:6px;padding:0 4px}
+.plan-reason{display:block;font-size:11.5px;color:var(--blue);margin-top:4px;line-height:1.45}

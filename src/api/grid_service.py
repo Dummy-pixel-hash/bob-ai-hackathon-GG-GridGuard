@@ -36,10 +36,18 @@ from ai_briefing import (
 from ai_briefing.context_builder import AssetRegistryInfo, BriefingContextBuilder
 from data.demo_assets import ALL_ASSETS
 from data.raw_types import RawAssetRecord
+from maintenance.scheduler import MaintenancePlan, MaintenanceScheduler, ScheduledTask
 from normalisation.normaliser import normalise
 from risk_engine.calculator import score_asset
 from risk_engine.models import RiskInputs, RiskResult
-from storage.connection import get_connection
+from simulation.asset_sim import apply_weather_to_asset
+from simulation.scenario_runner import (
+    DEFAULT_SCENARIO,
+    SCENARIOS,
+    ScenarioRunner,
+    StepState,
+)
+from simulation.weather_sim import DEMO_PHASES, SimulationPhase, WeatherSimulator
 from storage.repositories.assets import AssetRepository
 from storage.repositories.grid_topology import GridTopologyRepository
 from storage.repositories.lifecycle import LifecycleRepository
@@ -47,6 +55,7 @@ from storage.repositories.retired import RetiredAssetRepository as RetiredReposi
 from storage.repositories.risk_results import RiskResultRepository
 from storage.schema import create_all_tables
 from storage.seeder import seed_demo_assets
+from storage.thread_local_conn import ThreadLocalConnFactory
 from weather.open_meteo import fetch_weather_with_fallback
 
 
@@ -147,6 +156,130 @@ _ACTION_BY_STATUS = {
 
 
 # ---------------------------------------------------------------------------
+# Simulation change-event helpers (presentation of backend truth)
+# ---------------------------------------------------------------------------
+# The frontend polls /api/scenario/tick every few seconds while a scenario
+# runs.  To let the operator *see* what changed without reading logs,
+# GridState diffs consecutive scoring snapshots and exposes the per-asset
+# transitions as a consumed-on-read ``changes`` list.  This is presentation
+# only — it never invents coordinates, scores, or risk values; every field
+# is derived from engine RiskResult outputs.
+# ---------------------------------------------------------------------------
+
+#: Minimum |overall_risk delta| that counts as a visible change event.
+_CHANGE_RISK_DELTA_THRESHOLD = 0.5
+
+#: Cap on unconsumed pending events (oldest are dropped first).
+_MAX_PENDING_CHANGE_EVENTS = 200
+
+#: Statuses that mark an asset as an elevated operational priority.
+_ALERT_STATUSES = ("High", "Critical")
+
+#: Urgency implied by status for static (non-scheduler) plan rows, mirroring
+#: the scheduler's _ACTION_BY_STATUS mapping so diffs can span both shapes.
+_STATIC_URGENCY = {
+    "Critical": "immediate",
+    "High": "priority",
+    "Monitoring": "routine",
+    "Healthy": "monitor",
+}
+
+
+def _scheduler_plan_view(tasks: list) -> dict[str, dict]:
+    """Normalise scheduler ``ScheduledTask`` list to a per-asset view."""
+    return {
+        t.asset_id: {
+            "rank": t.rank,
+            "status": t.status,
+            "urgency": t.urgency,
+            "assigned_crew": t.assigned_crew,
+            "overall_risk": t.overall_risk,
+        }
+        for t in tasks
+    }
+
+
+def _static_plan_view(priorities_payload: dict) -> dict[str, dict]:
+    """Normalise static ``priorities()`` rows to the same per-asset view."""
+    view: dict[str, dict] = {}
+    for row in priorities_payload.get("maintenance_plan", []):
+        view[row["asset_id"]] = {
+            "rank": row["rank"],
+            "status": row["status"],
+            "urgency": _STATIC_URGENCY.get(row["status"], "monitor"),
+            "assigned_crew": None,
+            "overall_risk": row["overall_risk"],
+        }
+    return view
+
+
+def _snapshot_asset_views(assets: list[dict]) -> dict[str, dict]:
+    """Compact per-asset snapshot used for consecutive-state diffing."""
+    snap: dict[str, dict] = {}
+    for a in assets:
+        snap[a["id"]] = {
+            "status": a["status"],
+            "risk_level": a.get("risk_level"),
+            "overall_risk": a["overall_risk"],
+            "dominant_factor": a.get("dominant_factor"),
+            "dominant_factor_label": a.get("dominant_factor_label"),
+        }
+    return snap
+
+
+def _diff_asset_changes(
+    prev: dict[str, dict], new_assets: list[dict]
+) -> list[dict]:
+    """Diff two consecutive scoring snapshots into operator-facing events.
+
+    An event is emitted when an asset's risk band/status changed, or its
+    overall risk moved by at least ``_CHANGE_RISK_DELTA_THRESHOLD``.  Newly
+    elevated priorities (Monitoring/Healthy → High/Critical) and cleared
+    alerts are flagged explicitly so the UI can highlight them.
+    """
+    events: list[dict] = []
+    for a in new_assets:
+        p = prev.get(a["id"])
+        if p is None:
+            continue
+        new_risk = a["overall_risk"]
+        old_risk = p["overall_risk"]
+        delta = round(new_risk - old_risk, 1)
+        band_change = a.get("risk_level") != p.get("risk_level")
+        status_change = a["status"] != p["status"]
+        if not (band_change or status_change or abs(delta) >= _CHANGE_RISK_DELTA_THRESHOLD):
+            continue
+        elevated = a["status"] in _ALERT_STATUSES
+        was_elevated = p["status"] in _ALERT_STATUSES
+        events.append(
+            {
+                "asset_id": a["id"],
+                "previous_status": p["status"],
+                "new_status": a["status"],
+                "previous_risk": old_risk,
+                "new_risk": new_risk,
+                "risk_delta": delta,
+                "direction": "rising" if delta > 0 else ("falling" if delta < 0 else "flat"),
+                "band_change": band_change,
+                "status_change": status_change,
+                "newly_high_critical": bool(elevated and not was_elevated),
+                "cleared_alert": bool(was_elevated and not elevated),
+                "dominant_factor": a.get("dominant_factor"),
+                "dominant_factor_label": a.get("dominant_factor_label"),
+            }
+        )
+    # Deterministic order: escalations first, then the biggest movers.
+    events.sort(
+        key=lambda e: (
+            0 if e["newly_high_critical"] else (1 if e["band_change"] else 2),
+            -abs(e["risk_delta"]),
+            e["asset_id"],
+        )
+    )
+    return events
+
+
+# ---------------------------------------------------------------------------
 # Live weather refresh helper (opt-in — demo is static by default)
 # ---------------------------------------------------------------------------
 
@@ -211,15 +344,22 @@ class GridState:
         self.db_path = db_path
         # Pick up LLM keys / model from .env files (env vars always win).
         self.env_files: list[str] = load_dotenv()
-        self.conn: sqlite3.Connection = get_connection(db_path)
-        create_all_tables(self.conn)
-        seed_demo_assets(self.conn)
 
-        self._asset_repo = AssetRepository(self.conn)
-        self._topo_repo = GridTopologyRepository(self.conn)
-        self._lifecycle_repo = LifecycleRepository(self.conn)
-        self._retired_repo = RetiredRepository(self.conn)
-        self._risk_repo = RiskResultRepository(self.conn)
+        # ── Thread-safe database access ──────────────────────────────────────
+        # ThreadLocalConnFactory provides the correct sqlite3.Connection for
+        # the calling thread.  For file-backed databases each thread gets its
+        # own connection (SQLite WAL handles concurrent access).  For
+        # ":memory:" a single shared connection is used with a threading.Lock.
+        # This eliminates the "SQLite objects created in a thread can only be
+        # used in that same thread" crash in ThreadingHTTPServer.
+        self._db = ThreadLocalConnFactory(db_path)
+
+        # Schema + seed run on the main thread via acquire/release so the data
+        # is visible to subsequent reads from the same connection (memory) or
+        # file (file-backed).
+        with self._db.connection() as conn:
+            create_all_tables(conn)
+            seed_demo_assets(conn)
 
         # Weather: staged static demo data by default (deterministic demo).
         # Live Open-Meteo refresh only when explicitly opted in via
@@ -239,27 +379,64 @@ class GridState:
         self._raw: dict[str, RawAssetRecord] = {
             r.metadata.asset_id: r for r in live_assets
         }
+        # Keep the original (unmodified) static records for simulation fallback.
+        self._raw_static: dict[str, RawAssetRecord] = dict(self._raw)
 
         # Normalised inputs + engine results by id.
         self._inputs: dict[str, RiskInputs] = {}
         self._results: dict[str, RiskResult] = {}
 
-        for raw in live_assets:
-            inputs = normalise(raw)
-            result = score_asset(inputs)
-            self._inputs[raw.metadata.asset_id] = inputs
-            self._results[raw.metadata.asset_id] = result
-            # Persist a scoring snapshot (storage layer stays the audit trail).
-            try:
-                self._risk_repo.insert(result)
-            except Exception:
-                pass
+        with self._db.connection() as conn:
+            risk_repo = RiskResultRepository(conn)
+            for raw in live_assets:
+                inputs = normalise(raw)
+                result = score_asset(inputs)
+                self._inputs[raw.metadata.asset_id] = inputs
+                self._results[raw.metadata.asset_id] = result
+                # Persist a scoring snapshot (storage layer stays the audit trail).
+                try:
+                    risk_repo.insert(result)
+                except Exception:
+                    pass
 
         self._assets: list[dict] = [
             self._build_asset_view(aid) for aid in sorted(self._raw)
         ]
+        # ── Change-event tracking (operator-facing event feed) ───────────────
+        # _prev_asset_snapshots holds the last *scored* state; every
+        # _apply_simulation*() call diffs the new scores against it and
+        # appends events to _pending_changes, which are consumed on read by
+        # simulation_status() (→ scenario_tick → frontend poll).
+        self._prev_asset_snapshots: dict[str, dict] = _snapshot_asset_views(
+            self._assets
+        )
+        self._pending_changes: list[dict] = []
+        # Comparison baseline for maintenance-plan diffs: a normalised view of
+        # the last plan the operator saw (approved, sim, or static).  Advanced
+        # only on plan transitions (build/approve/reject/stop) — never on
+        # read — so consecutive polls show a stable diff until the next
+        # scheduler run produces a new plan.
+        self._plan_baseline: dict[str, dict] | None = None
         self._briefing_service: BriefingService | None = None
         self._provider_warning: str = ""
+
+        # ── Simulation layer (off by default — static demo is the fallback) ──
+        # The simulator advances through named phases.  When active=True the
+        # assets/priorities endpoints serve simulation-adjusted data.  When
+        # active=False the original static demo data is served unchanged.
+        self._sim_active: bool = False
+        self._simulator: WeatherSimulator | None = None
+        self._sim_plan: MaintenancePlan | None = None
+        self._approved_plan: MaintenancePlan | None = None
+        # Effective_pressure per asset_id from the last simulation step
+        self._sim_pressure: dict[str, float] = {}
+
+        # ── Scenario runner (autonomous timed simulation) ─────────────────────
+        # When a scenario is running the runner tracks wall-clock elapsed time
+        # and the tick() method returns interpolated StepState values that
+        # drive _apply_simulation_step().
+        self._runner: ScenarioRunner | None = None
+        self._last_step: StepState | None = None
 
     # -- public accessors -------------------------------------------------
 
@@ -382,6 +559,624 @@ class GridState:
             "generated_at": generated_at,
             "maintenance_plan": plan,
             "crew_prepositioning": crew_list,
+        }
+
+    # -- Simulation change-event + plan-delta internals ---------------------
+
+    def _record_asset_changes(self, assets: list[dict]) -> None:
+        """Diff ``assets`` against the previous snapshot and queue events.
+
+        Called after every simulation re-score.  Events accumulate in
+        ``_pending_changes`` until consumed by ``simulation_status()``.
+        """
+        events = _diff_asset_changes(self._prev_asset_snapshots, assets)
+        if events:
+            self._pending_changes.extend(events)
+            overflow = len(self._pending_changes) - _MAX_PENDING_CHANGE_EVENTS
+            if overflow > 0:
+                del self._pending_changes[:overflow]
+        self._prev_asset_snapshots = _snapshot_asset_views(assets)
+
+    def _pop_changes(self) -> list[dict]:
+        """Return pending change events and clear the queue (event semantics).
+
+        Each poll of the frontend consumes the events once — a second read
+        returns an empty list until the next simulation re-score produces
+        new transitions.
+        """
+        events = list(self._pending_changes)
+        self._pending_changes = []
+        return events
+
+    def _plan_task_changes(self, plan: MaintenancePlan) -> list[dict]:
+        """Diff ``plan`` against the last-seen plan baseline.
+
+        Returns per-task transitions (rank/status/urgency/crew/risk deltas)
+        so the maintenance view can reorder *and* visibly highlight newly
+        promoted items.  This is presentation of two scheduler outputs — no
+        scoring logic lives here.
+
+        The baseline (``_plan_baseline``) is a normalised view of the
+        previously served plan; it falls back to the static priorities view
+        when no sim/approved plan preceded this one.
+        """
+        prev = self._plan_baseline or _static_plan_view(self.priorities())
+        prev = {k: v for k, v in prev.items()}
+        out: list[dict] = []
+        for t in plan.tasks:
+            p = prev.get(t.asset_id)
+            if p is None:
+                continue
+            risk_delta = round(t.overall_risk - p["overall_risk"], 1)
+            moved = t.rank != p["rank"]
+            status_changed = t.status != p["status"]
+            urgency_changed = t.urgency != p["urgency"]
+            crew_changed = (t.assigned_crew or None) != (p["assigned_crew"] or None)
+            risk_moved = abs(risk_delta) >= _CHANGE_RISK_DELTA_THRESHOLD
+            if not (moved or status_changed or urgency_changed or crew_changed or risk_moved):
+                continue
+            out.append(
+                {
+                    "asset_id": t.asset_id,
+                    "rank_from": p["rank"],
+                    "rank_to": t.rank,
+                    "rank_delta": p["rank"] - t.rank,  # positive = moved up
+                    "moved_up": t.rank < p["rank"],
+                    "moved_down": t.rank > p["rank"],
+                    "status_from": p["status"],
+                    "status_to": t.status,
+                    "urgency_from": p["urgency"],
+                    "urgency_to": t.urgency,
+                    "crew_from": p["assigned_crew"],
+                    "crew_to": t.assigned_crew,
+                    "risk_from": p["overall_risk"],
+                    "risk_to": t.overall_risk,
+                    "risk_delta": risk_delta,
+                    "newly_high_critical": (
+                        t.status in _ALERT_STATUSES and p["status"] not in _ALERT_STATUSES
+                    ),
+                    "scheduling_reason": t.scheduling_reason,
+                }
+            )
+        # Deterministic order: biggest rank climbs first.
+        out.sort(key=lambda c: (-c["rank_delta"], c["asset_id"]))
+        return out
+
+    def _current_plan_view(self) -> dict[str, dict]:
+        """Normalised view of the currently served maintenance plan."""
+        if self._approved_plan is not None:
+            return _scheduler_plan_view(self._approved_plan.tasks)
+        if self._sim_plan is not None:
+            return _scheduler_plan_view(self._sim_plan.tasks)
+        return _static_plan_view(self.priorities())
+
+    # -- Simulation API methods -------------------------------------------
+
+    def simulation_status(self) -> dict:
+        """Return the current simulation state for the UI.
+
+        The ``changes`` list carries per-asset transitions since the last
+        poll and is consumed on read — the frontend uses it to flash the
+        affected map markers and feed the event strip.
+        """
+        if not self._sim_active or self._simulator is None:
+            return {
+                "active": False,
+                "phase": None,
+                "phase_index": None,
+                "phase_label": None,
+                "phase_description": None,
+                "total_phases": len(DEMO_PHASES),
+                "phases": [
+                    {
+                        "index": i,
+                        "phase": p.phase.value,
+                        "label": p.label,
+                        "description": p.description,
+                    }
+                    for i, p in enumerate(DEMO_PHASES)
+                ],
+                "live_weather_base": False,
+                "plan_pending_approval": False,
+                "plan_approved": False,
+                "changes": [],
+            }
+
+        info = self._simulator.phase_info
+        return {
+            "active": True,
+            "phase": self._simulator.current_phase.value,
+            "phase_index": self._simulator.phase_index,
+            "phase_label": info.label,
+            "phase_description": info.description,
+            "total_phases": len(DEMO_PHASES),
+            "phases": [
+                {
+                    "index": i,
+                    "phase": p.phase.value,
+                    "label": p.label,
+                    "description": p.description,
+                }
+                for i, p in enumerate(DEMO_PHASES)
+            ],
+            "live_weather_base": self._simulator.live_base,
+            "sensor_pressure_per_asset": dict(self._sim_pressure),
+            "plan_pending_approval": self._sim_plan is not None and not (
+                self._sim_plan.approved
+            ),
+            "plan_approved": self._approved_plan is not None and self._approved_plan.approved,
+            "changes": self._pop_changes(),
+        }
+
+    def simulation_start(
+        self,
+        lat: float | None = None,
+        lon: float | None = None,
+        phase: str | None = None,
+    ) -> dict:
+        """
+        Start the live simulation.
+
+        Optionally seed a specific lat/lon (defaults to TX-007 Waterfront).
+        The simulator attempts a live Open-Meteo fetch; on failure it falls
+        back to the static TX-007 base weather — the demo never breaks.
+        """
+        # TX-007 default location
+        use_lat = lat if lat is not None else 51.507
+        use_lon = lon if lon is not None else -0.060
+
+        self._simulator = WeatherSimulator(
+            base_lat=use_lat,
+            base_lon=use_lon,
+            attempt_live=True,
+        )
+        if phase:
+            try:
+                self._simulator.set_phase(SimulationPhase(phase))
+            except ValueError:
+                pass  # ignore unknown phase; keep default CALM
+
+        self._sim_active = True
+        self._sim_plan = None
+        self._approved_plan = None
+        self._apply_simulation()
+        return self.simulation_status()
+
+    def simulation_advance(self) -> dict:
+        """Advance to the next simulation phase and recompute scores."""
+        if not self._sim_active or self._simulator is None:
+            return {"error": "simulation not active"}
+        self._simulator.advance()
+        self._apply_simulation()
+        return self.simulation_status()
+
+    def simulation_set_phase(self, phase: str) -> dict:
+        """Jump directly to a named simulation phase."""
+        if not self._sim_active or self._simulator is None:
+            return {"error": "simulation not active"}
+        try:
+            self._simulator.set_phase(SimulationPhase(phase))
+        except ValueError:
+            return {"error": f"unknown phase '{phase}'"}
+        self._apply_simulation()
+        return self.simulation_status()
+
+    def simulation_stop(self) -> dict:
+        """Stop the simulation and restore static demo data."""
+        self._sim_active = False
+        self._simulator = None
+        self._sim_plan = None
+        self._approved_plan = None
+        self._sim_pressure = {}
+        self._pending_changes = []
+        self._plan_baseline = None
+        # Restore original static records and re-score
+        self._raw = dict(self._raw_static)
+        for raw in self._raw.values():
+            inputs = normalise(raw)
+            result = score_asset(inputs)
+            self._inputs[raw.metadata.asset_id] = inputs
+            self._results[raw.metadata.asset_id] = result
+        self._assets = [
+            self._build_asset_view(aid) for aid in sorted(self._raw)
+        ]
+        self._prev_asset_snapshots = _snapshot_asset_views(self._assets)
+        return {"active": False, "message": "Simulation stopped — static demo data restored."}
+
+    def simulation_plan(self) -> dict:
+        """Return the current proposed maintenance plan (simulation or static).
+
+        Simulation plans carry a ``task_changes`` list of per-task
+        transitions vs. the previously served plan (rank/status/urgency/crew
+        deltas) so the maintenance view can visibly react to the simulation.
+        """
+        if self._approved_plan is not None:
+            # The approved plan is what the operator confirmed — no pending
+            # deltas remain against it.
+            plan_d = self._plan_to_dict(self._approved_plan, pending=False)
+            plan_d["task_changes"] = []
+            return plan_d
+        if self._sim_plan is not None:
+            plan_d = self._plan_to_dict(self._sim_plan, pending=True)
+            plan_d["task_changes"] = self._plan_task_changes(self._sim_plan)
+            return plan_d
+        # Fall back to the existing static priorities()
+        return self.priorities()
+
+    def simulation_approve_plan(self, approved_by: str = "operator") -> dict:
+        """Operator approves the pending simulation maintenance plan."""
+        if self._sim_plan is None:
+            return {"error": "no pending plan to approve"}
+        scheduler = MaintenanceScheduler(
+            sim_phase_label=self._simulator.phase_info.label if self._simulator else "",
+        )
+        self._approved_plan = scheduler.approve_plan(self._sim_plan, approved_by)
+        self._sim_plan = None  # consumed
+        # The approved plan is now the operator's current view — no pending
+        # deltas remain until the next scheduler run.
+        self._plan_baseline = None
+        return {
+            "approved": True,
+            "approved_at": self._approved_plan.approved_at,
+            "approved_by": self._approved_plan.approved_by,
+            "tasks": len(self._approved_plan.tasks),
+        }
+
+    def simulation_reject_plan(self) -> dict:
+        """Operator rejects the pending plan — it is discarded."""
+        if self._sim_plan is None:
+            return {"error": "no pending plan to reject"}
+        self._sim_plan = None
+        self._plan_baseline = None
+        return {"rejected": True, "message": "Proposed plan discarded — static plan remains active."}
+
+    # -- Scenario runner API methods ----------------------------------------
+
+    def scenario_list(self) -> dict:
+        """Return the list of available scenarios for the selector dropdown."""
+        return {
+            "scenarios": [
+                {
+                    "id": s["id"],
+                    "label": s["label"],
+                    "description": s["description"],
+                    "step_count": len(s["steps"]),
+                    "total_duration_s": sum(st.duration_s for st in s["steps"]),
+                }
+                for s in SCENARIOS.values()
+            ],
+            "default": DEFAULT_SCENARIO,
+        }
+
+    def scenario_run(
+        self,
+        scenario_id: str | None = None,
+        lat: float | None = None,
+        lon: float | None = None,
+    ) -> dict:
+        """
+        Start (or restart) an autonomous scenario.
+
+        Initialises the ``WeatherSimulator`` (live Open-Meteo if network is
+        available, static TX-007 baseline otherwise), then starts the
+        ``ScenarioRunner``.  The simulation layer is activated so
+        ``/api/assets`` and ``/api/priorities`` return simulation-adjusted data.
+        """
+        sid = scenario_id or DEFAULT_SCENARIO
+        try:
+            runner = ScenarioRunner(sid)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+        use_lat = lat if lat is not None else 51.507
+        use_lon = lon if lon is not None else -0.060
+
+        self._simulator = WeatherSimulator(
+            base_lat=use_lat,
+            base_lon=use_lon,
+            attempt_live=True,
+        )
+        self._sim_active = True
+        self._sim_plan = None
+        self._approved_plan = None
+        self._runner = runner
+        self._runner.run()
+
+        # Apply the initial step immediately
+        state = self._runner.tick()
+        self._last_step = state
+        self._apply_simulation_step(state)
+        return self._scenario_status()
+
+    def scenario_pause(self) -> dict:
+        """Pause the running scenario (elapsed time is frozen)."""
+        if self._runner is None:
+            return {"error": "no scenario running"}
+        self._runner.pause()
+        # Refresh _last_step so _scenario_status() reflects the new paused state
+        self._last_step = self._runner.tick()
+        return self._scenario_status()
+
+    def scenario_resume(self) -> dict:
+        """Resume a paused scenario."""
+        if self._runner is None:
+            return {"error": "no scenario running"}
+        self._runner.resume()
+        # Refresh _last_step so _scenario_status() reflects resumed state
+        self._last_step = self._runner.tick()
+        return self._scenario_status()
+
+    def scenario_reset(self) -> dict:
+        """
+        Stop the scenario and restore the static demo data.
+
+        Leaves the runner and simulator objects as None so the UI returns to
+        the unmodified static demo.
+        """
+        if self._runner is not None:
+            self._runner.reset()
+        self._runner = None
+        self._last_step = None
+        # Delegate the full teardown to simulation_stop()
+        return self.simulation_stop()
+
+    def scenario_tick(self) -> dict:
+        """
+        Advance time and return the current scenario state.
+
+        Should be polled by the frontend every 2–3 seconds while the scenario
+        is running.  Re-applies simulation to assets only when the step index
+        or sensor pressure has changed enough to matter (> 0.01 change).
+
+        Returns the scenario status dict (a superset of simulation_status).
+        """
+        if self._runner is None or not self._sim_active:
+            return {"active": False, "scenario_active": False}
+
+        state = self._runner.tick()
+        self._last_step = state
+
+        # Re-apply if running (not paused) and sensor pressure changed > 1%
+        prev_pressure = self._sim_pressure.get("__last_pressure__", -999.0)
+        pressure_delta = abs(state.sensor_pressure - prev_pressure)
+        if state.running and pressure_delta > 0.01:
+            self._sim_pressure["__last_pressure__"] = state.sensor_pressure
+            # Sync the WeatherSimulator phase so _apply_simulation_step
+            # picks up the right weather multipliers
+            if self._simulator:
+                self._simulator.set_phase(state.phase)
+            self._apply_simulation_step(state)
+
+        return self._scenario_status()
+
+    def _scenario_status(self) -> dict:
+        """Build the combined scenario + simulation status dict."""
+        base = self.simulation_status()
+        if self._runner is None or self._last_step is None:
+            return {
+                **base,
+                "scenario_active": False,
+                "scenario_id": None,
+                "scenario_label": None,
+                "scenario_description": None,
+                "step_index": None,
+                "total_steps": None,
+                "step_progress": None,
+                "step_elapsed_s": None,
+                "step_duration_s": None,
+                "elapsed_s": None,
+                "paused": False,
+                "completed": False,
+            }
+        st = self._last_step
+        return {
+            **base,
+            "active": self._sim_active,
+            "scenario_active": True,
+            "scenario_id": st.scenario_id,
+            "scenario_label": st.scenario_label,
+            "step_index": st.step_index,
+            "total_steps": st.total_steps,
+            "phase": st.phase.value,
+            "phase_label": st.phase_info.label,
+            "phase_description": st.phase_info.description,
+            "sensor_pressure": st.sensor_pressure,
+            "step_progress": st.step_progress,
+            "step_elapsed_s": st.step_elapsed_s,
+            "step_duration_s": st.step_duration_s,
+            "elapsed_s": st.elapsed_s,
+            "running": st.running,
+            "paused": st.paused,
+            "completed": st.completed,
+        }
+
+    def _apply_simulation_step(self, state: StepState) -> None:
+        """
+        Re-score all assets using the given interpolated StepState.
+
+        This is the scenario-aware equivalent of ``_apply_simulation()``.
+        Instead of using ``self._simulator.phase_info.sensor_pressure``
+        verbatim it uses the interpolated ``state.sensor_pressure`` so
+        transitions between steps are smooth.
+        """
+        assert self._simulator is not None
+        sim_weather = self._simulator.current_weather()
+        phase_info = state.phase_info
+
+        self._sim_pressure = {}
+        new_inputs: dict = {}
+        new_results: dict = {}
+
+        for aid, static_raw in self._raw_static.items():
+            cond = apply_weather_to_asset(
+                static_raw,
+                sim_weather,
+                state.sensor_pressure,          # interpolated pressure
+            )
+            self._sim_pressure[aid] = cond.effective_pressure
+
+            sim_raw = copy.copy(static_raw)
+            sim_raw.telemetry = cond.telemetry
+            sim_raw.weather = cond.weather
+            self._raw[aid] = sim_raw
+
+            inputs = normalise(sim_raw)
+            result = score_asset(inputs)
+            new_inputs[aid] = inputs
+            new_results[aid] = result
+
+        self._inputs = new_inputs
+        self._results = new_results
+
+        with self._db.connection() as conn:
+            risk_repo = RiskResultRepository(conn)
+            for result in new_results.values():
+                try:
+                    risk_repo.insert(result)
+                except Exception:
+                    pass
+
+        self._assets = [
+            self._build_asset_view(aid) for aid in sorted(self._raw)
+        ]
+
+        # Track per-asset transitions since the previous snapshot so the
+        # UI can flash changed markers and feed the simulation event strip.
+        self._record_asset_changes(self._assets)
+
+        results_list = list(self._results.values())
+        scheduler = MaintenanceScheduler(
+            sim_phase_label=phase_info.label,
+        )
+        previous = self._approved_plan
+        # Capture the previously served plan view BEFORE it is replaced, so
+        # the new plan can expose per-task deltas against it.
+        self._plan_baseline = self._current_plan_view()
+        self._sim_plan = scheduler.build_plan(
+            results=results_list,
+            asset_views=self._assets,
+            previous_plan=previous,
+        )
+
+    # -- Simulation internals -----------------------------------------------
+
+    def _apply_simulation(self) -> None:
+        """
+        Re-score all assets under the current simulation phase.
+
+        1. Derives phase-scaled weather from the simulator.
+        2. Applies per-asset sensor pressure proportional to degradation.
+        3. Builds modified ``RawAssetRecord`` with simulated telemetry/weather.
+        4. Re-normalises and re-scores through the real engine.
+        5. Rebuilds the asset view list.
+        6. Proposes a new maintenance plan via the deterministic scheduler.
+
+        Storage writes use the thread-local connection so this is safe to
+        call from any ThreadingHTTPServer handler thread.
+        """
+        assert self._simulator is not None
+        phase_info = self._simulator.phase_info
+        sim_weather = self._simulator.current_weather()
+
+        self._sim_pressure = {}
+        new_inputs: dict = {}
+        new_results: dict = {}
+
+        for aid, static_raw in self._raw_static.items():
+            cond = apply_weather_to_asset(
+                static_raw,
+                sim_weather,
+                phase_info.sensor_pressure,
+            )
+            self._sim_pressure[aid] = cond.effective_pressure
+
+            # Build a modified record with simulated telemetry + weather
+            sim_raw = copy.copy(static_raw)
+            sim_raw.telemetry = cond.telemetry
+            sim_raw.weather = cond.weather
+            self._raw[aid] = sim_raw
+
+            inputs = normalise(sim_raw)
+            result = score_asset(inputs)
+            new_inputs[aid] = inputs
+            new_results[aid] = result
+
+        self._inputs = new_inputs
+        self._results = new_results
+
+        # Persist simulation scoring snapshots using the calling thread's connection.
+        with self._db.connection() as conn:
+            risk_repo = RiskResultRepository(conn)
+            for result in new_results.values():
+                try:
+                    risk_repo.insert(result)
+                except Exception:
+                    pass
+
+        self._assets = [
+            self._build_asset_view(aid) for aid in sorted(self._raw)
+        ]
+
+        # Track per-asset transitions since the previous snapshot so the
+        # UI can flash changed markers and feed the simulation event strip.
+        self._record_asset_changes(self._assets)
+
+        # Build a new proposed maintenance plan (pending operator approval)
+        results_list = list(self._results.values())
+        scheduler = MaintenanceScheduler(
+            sim_phase_label=phase_info.label,
+        )
+        previous = self._approved_plan  # detect reordering vs. last approved plan
+        # Capture the previously served plan view BEFORE it is replaced, so
+        # the new plan can expose per-task deltas against it.
+        self._plan_baseline = self._current_plan_view()
+        self._sim_plan = scheduler.build_plan(
+            results=results_list,
+            asset_views=self._assets,
+            previous_plan=previous,
+        )
+
+    def _plan_to_dict(self, plan: MaintenancePlan, pending: bool) -> dict:
+        """Serialise a MaintenancePlan to the API response shape."""
+        tasks = []
+        for t in plan.tasks:
+            tasks.append(
+                {
+                    "rank": t.rank,
+                    "asset_id": t.asset_id,
+                    "substation": t.substation,
+                    "region": t.region,
+                    "status": t.status,
+                    "overall_risk": t.overall_risk,
+                    "grid_impact_score": t.grid_impact_score,
+                    "priority_score": t.priority_score,
+                    "urgency_bonus": t.urgency_bonus,
+                    "dominant_factor": t.dominant_factor,
+                    "dominant_factor_label": t.dominant_factor_label,
+                    "customers_served": t.customers_served,
+                    "critical_facilities": t.critical_facilities,
+                    "has_redundant_path": t.has_redundant_path,
+                    "recommended_action": t.recommended_action,
+                    "action_detail": t.action_detail,
+                    "urgency": t.urgency,
+                    "window_hours": t.window_hours,
+                    "assigned_crew": t.assigned_crew,
+                    "scheduled_start": t.scheduled_start,
+                    "scheduling_reason": t.scheduling_reason,
+                    "triggered_by_phase": t.triggered_by_phase,
+                    "reordered": t.reordered,
+                }
+            )
+        return {
+            "generated_at": plan.generated_at,
+            "simulation_phase": plan.simulation_phase,
+            "maintenance_plan": tasks,
+            "crew_prepositioning": plan.crew_prepositioning,
+            "approved": plan.approved,
+            "approved_at": plan.approved_at,
+            "approved_by": plan.approved_by,
+            "change_summary": plan.change_summary,
+            "pending_approval": pending,
         }
 
     def briefing_info(self) -> dict:
@@ -592,80 +1387,85 @@ class GridState:
         raw = self._raw[asset_id]
         inputs = self._inputs[asset_id]
         result = self._results[asset_id]
-        meta = self._asset_repo.get(asset_id)
-        topo = self._topo_repo.get(asset_id)
-        lc = self._lifecycle_repo.get(asset_id)
 
-        status = LEVEL_TO_STATUS[result.risk_level.value]
-        action, action_detail = _ACTION_BY_STATUS[status]
+        # All repository reads use a thread-local connection so this method
+        # is safe to call from any handler thread.
+        with self._db.connection() as conn:
+            meta = AssetRepository(conn).get(asset_id)
+            topo = GridTopologyRepository(conn).get(asset_id)
+            lc = LifecycleRepository(conn).get(asset_id)
 
-        # Lifecycle view: prefer the stored record (single source of truth),
-        # fall back to the raw snapshot fields if storage is unavailable.
-        if lc is not None:
-            fault_history = [asdict(e) for e in lc.fault_history]
-            maint_history = [asdict(e) for e in lc.maintenance_history]
-            lifecycle = {
-                "state": lc.state.value,
-                "age_years": lc.age_years,
-                "rated_lifespan_years": lc.rated_lifespan_years,
-                "past_rated_lifespan": lc.is_past_rated_lifespan,
-                "remaining_life_years": round(lc.remaining_life_years, 1),
-                "insulation_health_pct": lc.insulation_health_pct,
-                "cumulative_fault_events": lc.cumulative_fault_events,
-                "maintenance_overdue_days": lc.maintenance_overdue_days,
-                "average_load_factor": lc.average_load_factor,
-                "failure_count_last_5yr": lc.failure_count_last_5yr,
-                "failures_caused_by_weather": lc.failures_caused_by_weather,
-                "last_failure_days_ago": lc.last_failure_days_ago,
-                "repeat_fault_active": lc.repeat_fault_active,
-                "fault_history": fault_history,
-                "maintenance_history": maint_history,
-                "predecessor_asset_id": lc.predecessor_asset_id,
-            }
-        else:
-            d = raw.degradation
-            lifecycle = {
-                "state": "active",
-                "age_years": d.age_years,
-                "rated_lifespan_years": meta.rated_lifespan_years if meta else 40.0,
-                "past_rated_lifespan": d.age_years
-                > (meta.rated_lifespan_years if meta else 40.0),
-                "remaining_life_years": round(
-                    (meta.rated_lifespan_years if meta else 40.0) - d.age_years, 1
-                ),
-                "insulation_health_pct": d.insulation_health_pct,
-                "cumulative_fault_events": d.cumulative_fault_events,
-                "maintenance_overdue_days": d.maintenance_overdue_days,
-                "average_load_factor": d.average_load_factor,
-                "failure_count_last_5yr": raw.incidents.failure_count_last_5yr,
-                "failures_caused_by_weather": raw.incidents.failures_caused_by_weather,
-                "last_failure_days_ago": raw.incidents.last_failure_days_ago,
-                "repeat_fault_active": raw.incidents.repeat_mode_flag,
-                "fault_history": [],
-                "maintenance_history": [],
-                "predecessor_asset_id": None,
-            }
+            status = LEVEL_TO_STATUS[result.risk_level.value]
+            action, action_detail = _ACTION_BY_STATUS[status]
 
-        # Lineage: retired predecessors / successors known to storage.
-        lineage: dict = {"predecessor": None, "successor_of_retired": None}
-        try:
-            if lifecycle["predecessor_asset_id"]:
-                pred = self._retired_repo.get(lifecycle["predecessor_asset_id"])
-                if pred is not None:
-                    lineage["predecessor"] = {
-                        "asset_id": pred.asset_id,
-                        "age_at_retirement_years": pred.age_at_retirement_years,
-                        "retirement_reason": pred.retirement_reason,
-                        "successor_asset_id": pred.successor_asset_id,
-                    }
-            by_succ = self._retired_repo.get_by_successor(asset_id)
-            if by_succ is not None:
-                lineage["successor_of_retired"] = {
-                    "asset_id": by_succ.asset_id,
-                    "retirement_reason": by_succ.retirement_reason,
+            # Lifecycle view: prefer the stored record (single source of truth),
+            # fall back to the raw snapshot fields if storage is unavailable.
+            if lc is not None:
+                fault_history = [asdict(e) for e in lc.fault_history]
+                maint_history = [asdict(e) for e in lc.maintenance_history]
+                lifecycle = {
+                    "state": lc.state.value,
+                    "age_years": lc.age_years,
+                    "rated_lifespan_years": lc.rated_lifespan_years,
+                    "past_rated_lifespan": lc.is_past_rated_lifespan,
+                    "remaining_life_years": round(lc.remaining_life_years, 1),
+                    "insulation_health_pct": lc.insulation_health_pct,
+                    "cumulative_fault_events": lc.cumulative_fault_events,
+                    "maintenance_overdue_days": lc.maintenance_overdue_days,
+                    "average_load_factor": lc.average_load_factor,
+                    "failure_count_last_5yr": lc.failure_count_last_5yr,
+                    "failures_caused_by_weather": lc.failures_caused_by_weather,
+                    "last_failure_days_ago": lc.last_failure_days_ago,
+                    "repeat_fault_active": lc.repeat_fault_active,
+                    "fault_history": fault_history,
+                    "maintenance_history": maint_history,
+                    "predecessor_asset_id": lc.predecessor_asset_id,
                 }
-        except Exception:
-            pass
+            else:
+                d = raw.degradation
+                lifecycle = {
+                    "state": "active",
+                    "age_years": d.age_years,
+                    "rated_lifespan_years": meta.rated_lifespan_years if meta else 40.0,
+                    "past_rated_lifespan": d.age_years
+                    > (meta.rated_lifespan_years if meta else 40.0),
+                    "remaining_life_years": round(
+                        (meta.rated_lifespan_years if meta else 40.0) - d.age_years, 1
+                    ),
+                    "insulation_health_pct": d.insulation_health_pct,
+                    "cumulative_fault_events": d.cumulative_fault_events,
+                    "maintenance_overdue_days": d.maintenance_overdue_days,
+                    "average_load_factor": d.average_load_factor,
+                    "failure_count_last_5yr": raw.incidents.failure_count_last_5yr,
+                    "failures_caused_by_weather": raw.incidents.failures_caused_by_weather,
+                    "last_failure_days_ago": raw.incidents.last_failure_days_ago,
+                    "repeat_fault_active": raw.incidents.repeat_mode_flag,
+                    "fault_history": [],
+                    "maintenance_history": [],
+                    "predecessor_asset_id": None,
+                }
+
+            # Lineage: retired predecessors / successors known to storage.
+            lineage: dict = {"predecessor": None, "successor_of_retired": None}
+            try:
+                retired_repo = RetiredRepository(conn)
+                if lifecycle["predecessor_asset_id"]:
+                    pred = retired_repo.get(lifecycle["predecessor_asset_id"])
+                    if pred is not None:
+                        lineage["predecessor"] = {
+                            "asset_id": pred.asset_id,
+                            "age_at_retirement_years": pred.age_at_retirement_years,
+                            "retirement_reason": pred.retirement_reason,
+                            "successor_asset_id": pred.successor_asset_id,
+                        }
+                by_succ = retired_repo.get_by_successor(asset_id)
+                if by_succ is not None:
+                    lineage["successor_of_retired"] = {
+                        "asset_id": by_succ.asset_id,
+                        "retirement_reason": by_succ.retirement_reason,
+                    }
+            except Exception:
+                pass
 
         t = raw.telemetry
         w = raw.weather
